@@ -2,12 +2,17 @@ name: Publish
 
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish, e.g. 0.1.1 or 0.2.0"
+        required: true
+        type: string
   push:
     tags:
       - "v*"
 
 permissions:
-  contents: read
+  contents: write
   id-token: write
 
 concurrency:
@@ -19,6 +24,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-node@v6
         with:
@@ -28,8 +35,22 @@ jobs:
 
       - run: npm ci
 
+      - name: Configure git author
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Bump version from input
+        if: github.event_name == 'workflow_dispatch'
+        run: npm version "${{ inputs.version }}" -m "chore(release): %s"
+
       - name: Release check
         run: npm run release:check
+
+      - name: Push release commit and tag
+        if: github.event_name == 'workflow_dispatch'
+        run: git push origin HEAD:main --follow-tags
 
       - name: Publish to npm
         run: npm publish
