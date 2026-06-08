@@ -27,7 +27,6 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 24
-          registry-url: https://registry.npmjs.org
           package-manager-cache: false
 
       - run: npm ci --legacy-peer-deps
@@ -38,22 +37,43 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Bump version from input
-        if: github.event_name == 'workflow_dispatch'
+      - name: Prepare release version
+        id: prepare
         run: |
-          npm version "${{ inputs.version }}" -m "chore(release): %s"
+          set -euo pipefail
+          target="${{ inputs.version }}"
+          current="$(node -p "require('./package.json').version")"
+          needs_push=false
+
+          if [ "$current" = "$target" ]; then
+            echo "package.json is already at $target; skipping npm version."
+            if ! git rev-parse "v$target" >/dev/null 2>&1; then
+              git tag "v$target"
+              needs_push=true
+            fi
+          else
+            npm version "$target" -m "chore(release): %s"
+            needs_push=true
+          fi
+
+          echo "needs_push=$needs_push" >> "$GITHUB_OUTPUT"
 
       - name: Release check
         run: npm run release:check
 
+      - name: Publish to npm
+        run: npm publish --provenance --access public
+
       - name: Push release commit and tag
-        if: github.event_name == 'workflow_dispatch'
+        if: steps.prepare.outputs.needs_push == 'true'
         run: git push origin HEAD:main --follow-tags
 
-      - name: Publish to npm
-        run: npm publish
-
       - name: Create GitHub release
-        run: gh release create "v${{ inputs.version }}" --title "v${{ inputs.version }}" --generate-notes
+        run: |
+          if gh release view "v${{ inputs.version }}" >/dev/null 2>&1; then
+            echo "GitHub release v${{ inputs.version }} already exists."
+          else
+            gh release create "v${{ inputs.version }}" --title "v${{ inputs.version }}" --generate-notes
+          fi
         env:
           GH_TOKEN: ${{ github.token }}
