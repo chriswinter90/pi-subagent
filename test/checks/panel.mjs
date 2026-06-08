@@ -224,7 +224,8 @@ async function main() {
     component.handleInput("\u001b[D");
     await waitFor(() => renderText(component).includes("[completed]") && renderText(component).includes("run_scroll_"), "left/completed filter");
 
-    await writeFile(join(cwd, ".pi/agent/runs/run_scroll_23/task-1/output.log"), "scroll run 23\nnew live tail\n");
+    const completedRunIds = ["run_done", ...Array.from({ length: 24 }, (_, index) => `run_scroll_${String(index).padStart(2, "0")}`)];
+    await Promise.all(completedRunIds.map((runId) => writeFile(join(cwd, ".pi/agent/runs", runId, "task-1/output.log"), `${runId}\nnew live tail\n`)));
     component.handleInput("r");
     await waitFor(() => renderText(component).includes("new live tail"), "manual refresh updates log tail");
 
