@@ -73,5 +73,5 @@ console.log(JSON.stringify({
   unpackedSize: summary.unpackedSize,
 }, null, 2));
 
-run("npm", ["publish", "--dry-run", "--access=public"]);
-console.log("\nRelease check passed. To publish manually, run: npm publish --access=public");
+run("npm", ["publish", "--dry-run"]);
+console.log("\nRelease check passed. To publish manually, run: npm publish");

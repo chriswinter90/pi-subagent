@@ -12,6 +12,9 @@
     "sandbox"
   ],
   "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
   "files": [
     "src",
     "docs",
