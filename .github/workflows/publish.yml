@@ -7,9 +7,6 @@ on:
         description: "Version to publish, e.g. 0.1.1 or 0.2.0"
         required: true
         type: string
-  push:
-    tags:
-      - "v*"
 
 permissions:
   contents: write
@@ -55,3 +52,8 @@ jobs:
 
       - name: Publish to npm
         run: npm publish
+
+      - name: Create GitHub release
+        run: gh release create "v${{ inputs.version }}" --title "v${{ inputs.version }}" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
