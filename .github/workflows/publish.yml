@@ -53,8 +53,10 @@ jobs:
 
           if [ "$current" = "$target" ]; then
             echo "package.json is already at $target; skipping npm version."
-            if ! git rev-parse "v$target" >/dev/null 2>&1; then
+            if ! git rev-parse -q --verify "refs/tags/v$target" >/dev/null 2>&1; then
               git tag "v$target"
+            fi
+            if ! git ls-remote --exit-code --tags origin "refs/tags/v$target" >/dev/null 2>&1; then
               needs_push=true
             fi
           else
@@ -64,22 +66,46 @@ jobs:
 
           echo "needs_push=$needs_push" >> "$GITHUB_OUTPUT"
 
+      - name: Check npm package version
+        id: npm_version
+        run: |
+          set -euo pipefail
+          name="$(node -p "require('./package.json').name")"
+          version="${{ inputs.version }}"
+          if npm view "$name@$version" version >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "$name@$version already exists on npm; publish will be skipped."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Release check
+        if: steps.npm_version.outputs.exists != 'true'
         run: npm run release:check
 
+      - name: Validation for already-published version
+        if: steps.npm_version.outputs.exists == 'true'
+        run: |
+          npm run check:scripts
+          npm run check:static
+          npm pack --dry-run --json
+
       - name: Publish to npm
+        if: steps.npm_version.outputs.exists != 'true'
         run: npm publish --access public
 
       - name: Push release commit and tag
         if: steps.prepare.outputs.needs_push == 'true'
-        run: git push origin HEAD:main --follow-tags
+        run: |
+          git push origin HEAD:main
+          git push origin "refs/tags/v${{ inputs.version }}"
 
       - name: Create GitHub release
         run: |
           if gh release view "v${{ inputs.version }}" >/dev/null 2>&1; then
             echo "GitHub release v${{ inputs.version }} already exists."
           else
-            gh release create "v${{ inputs.version }}" --title "v${{ inputs.version }}" --generate-notes
+            gh release create "v${{ inputs.version }}" --target "$GITHUB_SHA" --title "v${{ inputs.version }}" --generate-notes
           fi
         env:
           GH_TOKEN: ${{ github.token }}
