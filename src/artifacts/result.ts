@@ -1,7 +1,7 @@
 import type { FailureKind, ResolvedBackend, Status } from "../core/constants.ts";
 
-export const RESULT_SCHEMA_VERSION = 1 as const;
-export const ARTIFACT_TYPES = ["result", "stdout", "stderr", "output", "worktree-status", "worktree-diff"] as const;
+export const RESULT_SCHEMA_VERSION = 2 as const;
+export const ARTIFACT_TYPES = ["result", "stdout", "stderr", "output", "worker", "worktree-status", "worktree-diff"] as const;
 export const WORKSPACE_MODES = ["shared", "worktree", "auto"] as const;
 
 export type ArtifactType = (typeof ARTIFACT_TYPES)[number];
@@ -41,9 +41,18 @@ export interface CompletionMetadata {
   updatesSent: number;
 }
 
+export interface ResultMetadata {
+  contextLengthExceeded: boolean;
+  provider?: string;
+  model?: string;
+  usage?: unknown;
+  stopReason?: string;
+}
+
 export interface ResultEnvelopeInput {
   runId: string;
-  taskId: string;
+  attemptId: string;
+  correlationId?: string;
   backend: ResolvedBackend;
   status: Status;
   failureKind?: FailureKind | null;
@@ -58,12 +67,16 @@ export interface ResultEnvelopeInput {
   artifacts?: ArtifactRef[];
   tmux?: ResultTmuxMetadata;
   completion?: CompletionMetadata;
+  metadata?: Partial<ResultMetadata> | null;
+  /** @deprecated v1 compatibility only. */
+  taskId?: string;
 }
 
 export interface ResultEnvelope {
   schemaVersion: typeof RESULT_SCHEMA_VERSION;
   runId: string;
-  taskId: string;
+  attemptId: string;
+  correlationId?: string;
   backend: ResolvedBackend;
   status: Status;
   failureKind: FailureKind | null;
@@ -76,8 +89,11 @@ export interface ResultEnvelope {
   exitCode: number | null;
   signal: string | null;
   artifacts: ArtifactRef[];
+  metadata: ResultMetadata;
   tmux?: ResultTmuxMetadata;
   completion?: CompletionMetadata;
+  /** @deprecated v1 compatibility only. */
+  taskId?: string;
 }
 
 function toIsoTimestamp(value: string | Date, fieldName: string): string {
@@ -117,6 +133,17 @@ function normalizeSandbox(input: ResultEnvelopeInput): ResultSandbox {
 
   return {
     enabled: input.sandbox.enabled ?? true,
+  };
+}
+
+function normalizeMetadata(input: ResultEnvelopeInput): ResultMetadata {
+  const metadata = input.metadata ?? {};
+  return {
+    contextLengthExceeded: metadata.contextLengthExceeded ?? false,
+    ...(metadata.provider === undefined ? {} : { provider: metadata.provider }),
+    ...(metadata.model === undefined ? {} : { model: metadata.model }),
+    ...(metadata.usage === undefined ? {} : { usage: metadata.usage }),
+    ...(metadata.stopReason === undefined ? {} : { stopReason: metadata.stopReason }),
   };
 }
 
@@ -160,7 +187,8 @@ export function createResultEnvelope(input: ResultEnvelopeInput): ResultEnvelope
   return {
     schemaVersion: RESULT_SCHEMA_VERSION,
     runId: input.runId,
-    taskId: input.taskId,
+    attemptId: input.attemptId,
+    ...(input.correlationId === undefined ? {} : { correlationId: input.correlationId }),
     backend: input.backend,
     status: input.status,
     failureKind: input.failureKind ?? null,
@@ -173,7 +201,9 @@ export function createResultEnvelope(input: ResultEnvelopeInput): ResultEnvelope
     exitCode: input.exitCode ?? null,
     signal: input.signal ?? null,
     artifacts: dedupeArtifactRefs(input.artifacts ?? []),
+    metadata: normalizeMetadata(input),
     ...(input.tmux === undefined ? {} : { tmux: input.tmux }),
     ...(input.completion === undefined ? {} : { completion: input.completion }),
+    ...(input.taskId === undefined ? {} : { taskId: input.taskId }),
   };
 }

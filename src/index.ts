@@ -4,7 +4,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { loadAgentByName, type AgentDefinition } from "./agents.ts";
 import {
   appendRunEvent,
-  createTaskArtifactStore,
+  createAttemptArtifactStore,
   setRunDependency,
   type ArtifactRef,
   type ResultEnvelope,
@@ -25,8 +25,9 @@ import {
 } from "./core/constants.ts";
 import { resolveBackend } from "./core/resolver.ts";
 import { validateResolveInput } from "./core/validation.ts";
-import { startAsyncSubagentRun } from "./orchestrate/async.ts";
+import { startAsyncParallelSubagentRuns, startAsyncSubagentRun } from "./orchestrate/async.ts";
 import { interruptRun } from "./orchestrate/interrupt.ts";
+import { reconcileSubagentRun } from "./orchestrate/reconcile.ts";
 import { DEFAULT_PARALLEL_CONCURRENCY, runParallelSubagentTasks, runSubagentTask } from "./orchestrate/run.ts";
 import { getRunLogs, getRunStatus, waitForRun } from "./orchestrate/status.ts";
 import { showSubagentPanel } from "./panel.ts";
@@ -55,11 +56,17 @@ const SUPPORTED_KEYS = new Set([
   "timeoutMs",
   "model",
   "tools",
+  "systemPrompt",
+  "skills",
+  "extensions",
+  "runsDir",
+  "correlationId",
   "thinking",
   "thinkingLevel",
   "reasoningLevel",
   "action",
   "runId",
+  "attemptId",
   "taskId",
   "pollIntervalMs",
   "reason",
@@ -81,6 +88,9 @@ const SUBAGENT_TASK_SCHEMA = Type.Object({
   model: Type.Optional(Type.String({ minLength: 1 })),
   thinking: Type.Optional(Type.Union(THINKING_LEVELS.map((value) => Type.Literal(value)))),
   tools: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+  systemPrompt: Type.Optional(Type.String({ minLength: 1 })),
+  skills: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+  extensions: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
 });
 
 interface ToolTextContent {
@@ -151,7 +161,9 @@ function compactResult(result: ResultEnvelope, error?: string) {
     failureKind: result.failureKind,
     ...(error === undefined ? {} : { error }),
     runId: result.runId,
-    taskId: result.taskId,
+    attemptId: result.attemptId,
+    ...(result.taskId === undefined ? {} : { taskId: result.taskId }),
+    ...(result.correlationId === undefined ? {} : { correlationId: result.correlationId }),
     durationMs: result.durationMs,
     exitCode: result.exitCode,
     signal: result.signal,
@@ -159,6 +171,7 @@ function compactResult(result: ResultEnvelope, error?: string) {
     workspace: result.workspace,
     ...(result.tmux === undefined ? {} : { tmux: result.tmux }),
     ...(result.completion === undefined ? {} : { completion: result.completion }),
+    metadata: result.metadata,
     artifacts: artifactSummary(result.artifacts),
   };
 }
@@ -178,7 +191,7 @@ function subagentCallSummary(input: unknown): string {
 
   if (action === "run") {
     pieces.push(mode);
-    if (Array.isArray(args.tasks)) pieces.push(`${args.tasks.length} task${args.tasks.length === 1 ? "" : "s"}`);
+    if (Array.isArray(args.tasks)) pieces.push(`${args.tasks.length} run${args.tasks.length === 1 ? "" : "s"}`);
     const agent = displayText(args.agent, 24);
     if (agent) pieces.push(agent);
     const task = displayText(args.task, 48);
@@ -188,8 +201,8 @@ function subagentCallSummary(input: unknown): string {
   } else {
     const runId = displayText(args.runId, 28);
     if (runId) pieces.push(runId);
-    const taskId = displayText(args.taskId, 16);
-    if (taskId) pieces.push(taskId);
+    const attemptId = displayText(args.attemptId, 16) ?? displayText(args.taskId, 16);
+    if (attemptId) pieces.push(attemptId);
   }
 
   return pieces.filter(Boolean).join(" · ");
@@ -228,8 +241,8 @@ function optionalPositiveNumber(value: unknown, fieldName: string): number | und
 async function lifecycleAction(raw: Record<string, unknown>, cwd: string): Promise<ToolResult | null> {
   const action = raw.action ?? "run";
   if (action === "run") return null;
-  if (action !== "status" && action !== "logs" && action !== "wait" && action !== "interrupt" && action !== "mark-background") {
-    throw new InputValidationError('action must be one of "run", "status", "logs", "wait", "interrupt", or "mark-background" when provided.');
+  if (action !== "status" && action !== "logs" && action !== "wait" && action !== "interrupt" && action !== "mark-background" && action !== "reconcile") {
+    throw new InputValidationError('action must be one of "run", "status", "logs", "wait", "interrupt", "mark-background", or "reconcile" when provided.');
   }
 
   const runId = optionalString(raw.runId, "runId");
@@ -237,7 +250,8 @@ async function lifecycleAction(raw: Record<string, unknown>, cwd: string): Promi
   const ref = {
     cwd: optionalString(raw.cwd, "cwd") ?? cwd,
     runId,
-    taskId: optionalString(raw.taskId, "taskId"),
+    attemptId: optionalString(raw.attemptId, "attemptId") ?? optionalString(raw.taskId, "taskId"),
+    runsDir: optionalString(raw.runsDir, "runsDir"),
   };
 
   if (action === "status") {
@@ -265,6 +279,8 @@ async function lifecycleAction(raw: Record<string, unknown>, cwd: string): Promi
     const interrupted = await interruptRun({
       cwd: ref.cwd,
       runId,
+      runsDir: ref.runsDir,
+      attemptId: ref.attemptId,
       reason: optionalString(raw.reason, "reason"),
       signal,
       escalateAfterMs: optionalPositiveNumber(raw.escalateAfterMs, "escalateAfterMs"),
@@ -273,6 +289,12 @@ async function lifecycleAction(raw: Record<string, unknown>, cwd: string): Promi
     const snapshot = await getRunStatus(ref);
     const isError = interrupted.status === "not-found" || interrupted.status === "unsupported";
     return textResult({ tool: TOOL_NAME, action, status: interrupted.status, interrupted, snapshot }, isError, { interrupted, snapshot });
+  }
+
+  if (action === "reconcile") {
+    const reconciled = await reconcileSubagentRun(ref);
+    const snapshot = await getRunStatus(ref);
+    return textResult({ tool: TOOL_NAME, action, status: reconciled.status, reconciled, snapshot }, reconciled.status === "not-found", { reconciled, snapshot });
   }
 
   const waited = await waitForRun({ ...ref, timeoutMs: optionalPositiveNumber(raw.timeoutMs, "timeoutMs"), pollIntervalMs: optionalPositiveNumber(raw.pollIntervalMs, "pollIntervalMs") });
@@ -314,7 +336,7 @@ function unsupportedPathError(raw: Record<string, unknown>, input: ResolveInput,
 
 async function writeUnsupportedResult(cwd: string, backend: ResolvedBackend, input: ResolveInput): Promise<ResultEnvelope> {
   const startedAt = new Date();
-  const store = await createTaskArtifactStore({ cwd });
+  const store = await createAttemptArtifactStore({ cwd, runsDir: input.runsDir });
   const sandboxed = input.sandbox !== undefined && input.sandbox !== null;
   return await store.writeResult({
     backend,
@@ -328,6 +350,8 @@ async function writeUnsupportedResult(cwd: string, backend: ResolvedBackend, inp
     exitCode: null,
     signal: null,
     artifacts: [],
+    correlationId: input.correlationId,
+    metadata: { contextLengthExceeded: false },
   });
 }
 
@@ -403,7 +427,7 @@ function completionPayload(result: ResultEnvelope, mode: ExecutionMode) {
     event: "complete",
     mode,
     runId: result.runId,
-    taskId: result.taskId,
+    attemptId: result.attemptId,
     backend: result.backend,
     status: result.status,
     failureKind: result.failureKind,
@@ -422,7 +446,7 @@ function notifyCompletion(input: ResolveInput, result: ResultEnvelope, mode: Exe
     // Completion notifications must not change the task result.
   }
   try {
-    ctx?.ui?.notify?.(`subagent ${result.runId}/${result.taskId} ${result.status}`, result.status === "completed" ? "info" : "warning");
+    ctx?.ui?.notify?.(`subagent ${result.runId}/${result.attemptId} ${result.status}`, result.status === "completed" ? "info" : "warning");
     if (ctx?.ui?.notify) updatesSent += 1;
   } catch {
     // Completion notifications must not change the task result.
@@ -454,7 +478,7 @@ export default function registerSubagentEngine(pi: ExtensionAPI) {
     name: TOOL_NAME,
     label: "Subagent",
     description:
-      "Subagent engine. Executes headless/tmux/inline agent-task workers; supports workspace:auto/worktree isolation, bounded parallel fanout, async lifecycle lookup, mark-background, and conservative interrupt.",
+      "Subagent engine. Executes headless/tmux/inline workers; supports workspace:auto/worktree isolation, bounded parallel fanout, async lifecycle lookup, mark-background, reconcile, and conservative interrupt.",
     parameters: Type.Object({
       backend: Type.Optional(Type.Union(BACKENDS.map((value) => Type.Literal(value)))),
       visible: Type.Optional(Type.Boolean()),
@@ -466,7 +490,7 @@ export default function registerSubagentEngine(pi: ExtensionAPI) {
       confirmProjectAgents: Type.Optional(Type.Boolean()),
       mode: Type.Optional(Type.Union(EXECUTION_MODES.map((value) => Type.Literal(value)))),
       tasks: Type.Optional(Type.Array(SUBAGENT_TASK_SCHEMA, { minItems: 1 })),
-      concurrency: Type.Optional(Type.Number({ minimum: 1, description: `Maximum parallel tasks to run at once. Default ${DEFAULT_PARALLEL_CONCURRENCY}.` })),
+      concurrency: Type.Optional(Type.Number({ minimum: 1, description: `Maximum parallel runs to launch at once. Default ${DEFAULT_PARALLEL_CONCURRENCY}.` })),
       asyncDependency: Type.Optional(Type.Union(ASYNC_DEPENDENCIES.map((value) => Type.Literal(value)), { description: "Whether an async run is needed before final, background, or unclassified." })),
       workspace: Type.Optional(
         Type.Union([
@@ -484,18 +508,24 @@ export default function registerSubagentEngine(pi: ExtensionAPI) {
       onComplete: Type.Optional(Type.Union(ON_COMPLETE_ACTIONS.map((value) => Type.Literal(value)))),
       timeoutMs: Type.Optional(Type.Number({ exclusiveMinimum: 0 })),
       model: Type.Optional(Type.String({ minLength: 1, description: "Optional Pi model pattern or provider/model id for model-backed subagents." })),
-      tools: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "Optional tool allowlist for agentless model-backed runs. Ignored when agent is set; define agent tools in the agent file. Use [] to disable tools for an agentless run." })),
+      tools: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "Optional tool allowlist. With a named agent this may only narrow the agent-declared tools. Use [] to disable tools." })),
+      systemPrompt: Type.Optional(Type.String({ minLength: 1, description: "Optional compiled system prompt. When provided, it replaces the named agent prompt body but not agent frontmatter policy." })),
+      skills: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "Explicit Pi skills to load for headless/tmux child Pi; ambient skills stay disabled. Inline rejects this option." })),
+      extensions: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "Explicit Pi extensions to load for headless/tmux child Pi; ambient extensions stay disabled. Inline rejects this option." })),
+      runsDir: Type.Optional(Type.String({ minLength: 1, description: "Safe relative run/artifact root under cwd." })),
+      correlationId: Type.Optional(Type.String({ minLength: 1, description: "External correlation label; no aggregation semantics." })),
       thinking: Type.Optional(Type.Union(THINKING_LEVELS.map((value) => Type.Literal(value)), { description: "Optional Pi thinking/reasoning level." })),
       thinkingLevel: Type.Optional(Type.Union(THINKING_LEVELS.map((value) => Type.Literal(value)), { description: "Alias for thinking." })),
       reasoningLevel: Type.Optional(Type.Union(THINKING_LEVELS.map((value) => Type.Literal(value)), { description: "Alias for thinking." })),
       action: Type.Optional(
         Type.Union(
-          [Type.Literal("run"), Type.Literal("status"), Type.Literal("logs"), Type.Literal("wait"), Type.Literal("interrupt"), Type.Literal("mark-background")],
-          { default: "run", description: "What to do. Default \"run\" starts a new subagent. status/logs/wait/interrupt/mark-background operate on an existing runId." },
+          [Type.Literal("run"), Type.Literal("status"), Type.Literal("logs"), Type.Literal("wait"), Type.Literal("interrupt"), Type.Literal("mark-background"), Type.Literal("reconcile")],
+          { default: "run", description: "What to do. Default \"run\" starts a new subagent. status/logs/wait/interrupt/mark-background/reconcile operate on an existing runId." },
         ),
       ),
       runId: Type.Optional(Type.String({ minLength: 1 })),
-      taskId: Type.Optional(Type.String({ minLength: 1 })),
+      attemptId: Type.Optional(Type.String({ minLength: 1 })),
+      taskId: Type.Optional(Type.String({ minLength: 1, description: "Deprecated alias for attemptId when reading old runs." })),
       pollIntervalMs: Type.Optional(Type.Number({ exclusiveMinimum: 0 })),
       reason: Type.Optional(Type.String({ minLength: 1 })),
       signal: Type.Optional(Type.Union([Type.Literal("SIGINT"), Type.Literal("SIGTERM"), Type.Literal("SIGKILL")])),
@@ -532,7 +562,28 @@ export default function registerSubagentEngine(pi: ExtensionAPI) {
         const runCwd = validation.input.cwd ?? cwd;
         await maybeConfirmProjectAgents(validation.input, runCwd, ctx as ProjectAgentApprovalContext);
         const mode = executionMode(validation.input);
-        if (validation.input.async === true || validation.input.onComplete === "detach" || validation.input.onComplete === "notify") {
+        const asyncRequested = validation.input.async === true || validation.input.onComplete === "detach" || validation.input.onComplete === "notify";
+        if (mode === "parallel") {
+          const parallel = asyncRequested
+            ? await startAsyncParallelSubagentRuns(validation.input, runCwd, signal, (completed, completedMode) => notifyCompletion(validation.input, completed, completedMode, onUpdate, ctx as NotificationContext))
+            : await runParallelSubagentTasks(validation.input, runCwd, signal);
+          const runs = parallel.results.map((result) => compactResult(result));
+          const failed = !asyncRequested && parallel.results.some((result) => result.status !== "completed");
+          return textResult(
+            {
+              tool: TOOL_NAME,
+              mode: "parallel",
+              status: failed ? "failed" : asyncRequested ? "running" : "completed",
+              runIds: parallel.runIds,
+              concurrencyLimit: parallel.concurrency,
+              runs,
+            },
+            failed,
+            { results: parallel.results, resolved },
+          );
+        }
+
+        if (asyncRequested) {
           const result = await startAsyncSubagentRun({
             input: validation.input,
             cwd: runCwd,
@@ -543,35 +594,20 @@ export default function registerSubagentEngine(pi: ExtensionAPI) {
           return textResult(compactResult(result), false, { result, resolved });
         }
 
-        if (mode === "parallel") {
-          const parallel = await runParallelSubagentTasks(validation.input, runCwd, signal);
-          const tasks = parallel.results.map((result) => compactResult(result));
-          const failed = parallel.aggregate.status !== "completed";
-          return textResult(
-            {
-              tool: TOOL_NAME,
-              mode: "parallel",
-              status: parallel.aggregate.status,
-              failureKind: parallel.aggregate.failureKind,
-              runId: parallel.runId,
-              concurrencyLimit: parallel.concurrency,
-              aggregate: compactResult(parallel.aggregate),
-              tasks,
-            },
-            failed,
-            { aggregate: parallel.aggregate, results: parallel.results, resolved },
-          );
-        }
-
         const result = await runSubagentTask({ input: validation.input, cwd: runCwd, signal });
         return textResult(compactResult(result), result.status !== "completed", { result, resolved });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
+        const failureKind = error instanceof WorkspacePolicyError || error instanceof InputValidationError
+          ? error.failureKind
+          : typeof error === "object" && error !== null && (error as { failureKind?: unknown }).failureKind === "validation"
+            ? "validation"
+            : "internal";
         return textResult(
           {
             tool: TOOL_NAME,
             status: "failed",
-            failureKind: error instanceof WorkspacePolicyError || error instanceof InputValidationError ? error.failureKind : "internal",
+            failureKind,
             error: message,
           },
           true,

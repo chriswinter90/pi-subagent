@@ -5,7 +5,7 @@ import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { createTaskArtifactStore } from "../../src/artifacts/index.ts";
+import { createAttemptArtifactStore } from "../../src/artifacts/index.ts";
 import { finalizeWorktreeResult, resolveWorkspace } from "../../src/workspace/worktree.ts";
 
 const execFileAsync = promisify(execFile);
@@ -29,8 +29,8 @@ async function createRepo(root) {
   return repo;
 }
 
-async function syntheticResult(cwd, runId, taskId, status, workspace) {
-  const store = await createTaskArtifactStore({ cwd, runId, taskId });
+async function syntheticResult(cwd, runId, attemptId, status, workspace) {
+  const store = await createAttemptArtifactStore({ cwd, runId, attemptId });
   const artifacts = [
     await store.writeTextArtifact("stdout", ""),
     await store.writeTextArtifact("stderr", ""),
@@ -48,6 +48,7 @@ async function syntheticResult(cwd, runId, taskId, status, workspace) {
     exitCode: status === "completed" ? 0 : null,
     signal: null,
     artifacts,
+    metadata: { contextLengthExceeded: false },
   });
 }
 
@@ -58,7 +59,7 @@ try {
   const completedWorkspace = await resolveWorkspace({ cwd: repo, input: { worktree: true }, mode: "single", runId: "run_check_worktree_removed", taskIndex: 0 });
   await writeFile(join(completedWorkspace.cwd, "README.md"), "base\ncompleted change\n");
   await writeFile(join(completedWorkspace.cwd, "new-file.txt"), "new content\n");
-  const completed = await syntheticResult(repo, "run_check_worktree_removed", "task-1", "completed", {
+  const completed = await syntheticResult(repo, "run_check_worktree_removed", "attempt-1", "completed", {
     mode: completedWorkspace.mode,
     cwd: completedWorkspace.baseCwd,
     worktreePath: completedWorkspace.worktreePath,
@@ -74,7 +75,7 @@ try {
 
   const failedWorkspace = await resolveWorkspace({ cwd: repo, input: { worktree: true }, mode: "single", runId: "run_check_worktree_kept", taskIndex: 1 });
   await writeFile(join(failedWorkspace.cwd, "README.md"), "base\nfailed change\n");
-  const failed = await syntheticResult(repo, "run_check_worktree_kept", "task-1", "failed", {
+  const failed = await syntheticResult(repo, "run_check_worktree_kept", "attempt-1", "failed", {
     mode: failedWorkspace.mode,
     cwd: failedWorkspace.baseCwd,
     worktreePath: failedWorkspace.worktreePath,

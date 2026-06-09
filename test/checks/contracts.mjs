@@ -29,6 +29,11 @@ const plannedInput = {
   timeoutMs: 5000,
   model: "kimi-coding/kimi-for-coding",
   tools: ["read", "grep"],
+  systemPrompt: "Compiled system prompt",
+  skills: ["/tmp/skill"],
+  extensions: ["/tmp/extension.ts"],
+  runsDir: ".pi/custom-runs",
+  correlationId: "corr_contracts",
   reasoningLevel: "xhigh",
 };
 
@@ -42,6 +47,11 @@ assert.equal(validation.input.workspace.mode, "auto");
 assert.equal(validation.input.model, "kimi-coding/kimi-for-coding");
 assert.deepEqual(validation.input.tools, ["read", "grep"]);
 assert.equal(validation.input.thinking, "xhigh");
+assert.equal(validation.input.systemPrompt, "Compiled system prompt");
+assert.deepEqual(validation.input.skills, ["/tmp/skill"]);
+assert.deepEqual(validation.input.extensions, ["/tmp/extension.ts"]);
+assert.equal(validation.input.runsDir, ".pi/custom-runs");
+assert.equal(validation.input.correlationId, "corr_contracts");
 
 const taskModelValidation = validateResolveInput({
   mode: "parallel",
@@ -64,18 +74,20 @@ assert.match(chain.failure.error, /chain mode is not supported/);
 
 const result = createResultEnvelope({
   runId: "run_contracts_001",
-  taskId: "task-1",
+  attemptId: "attempt-contracts-001",
   backend: "headless",
   status: "failed",
   failureKind: "validation",
   cwd: process.cwd(),
   startedAt: "2026-06-07T00:00:00.000Z",
   completedAt: "2026-06-07T00:00:00.010Z",
-  artifacts: [{ type: "result", path: ".pi/agent/runs/run_contracts_001/task-1/result.json" }],
+  artifacts: [{ type: "result", path: ".pi/agent/runs/run_contracts_001/attempts/attempt-contracts-001/result.json" }],
+  metadata: { contextLengthExceeded: false },
 });
 const snapshot = createRunStatusSnapshot(result);
 assert.equal(snapshot.runId, result.runId);
-assert.equal(snapshot.resultPath, ".pi/agent/runs/run_contracts_001/task-1/result.json");
+assert.equal(snapshot.attemptId, "attempt-contracts-001");
+assert.equal(snapshot.resultPath, ".pi/agent/runs/run_contracts_001/attempts/attempt-contracts-001/result.json");
 assert.equal(isTerminalStatus("failed"), true);
 assert.equal(statusSucceeded("completed"), true);
 assert.equal(statusFailedClosed("failed", "validation"), true);

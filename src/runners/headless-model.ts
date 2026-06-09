@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { resolve } from "node:path";
 import { buildAgentSystemPrompt, type AgentDefinition } from "../agents.ts";
-import { createTaskArtifactStore, type ArtifactRef, type ProcessMetadata, type ResultEnvelope } from "../artifacts/index.ts";
+import { createAttemptArtifactStore, type ArtifactRef, type ProcessMetadata, type ResultEnvelope, type ResultMetadata } from "../artifacts/index.ts";
 import type { ResultWorkspace } from "../artifacts/result.ts";
 import type { AgentScope, FailureKind, SandboxInput, Status, ThinkingLevel } from "../core/constants.ts";
 import { SandboxUnavailableError, withSandboxedArgv } from "../sandbox/srt.ts";
@@ -15,8 +15,9 @@ export interface RunHeadlessModelOptions {
   cwd?: string;
   artifactCwd?: string;
   runId?: string;
-  taskId?: string;
+  attemptId?: string;
   runsDir?: string;
+  correlationId?: string;
   timeoutMs?: number;
   signal?: AbortSignal;
   piCommand?: string;
@@ -25,6 +26,9 @@ export interface RunHeadlessModelOptions {
   model?: string;
   thinking?: ThinkingLevel;
   tools?: string[];
+  systemPrompt?: string;
+  skills?: string[];
+  extensions?: string[];
   agentDefinition?: AgentDefinition;
   onProcessStart?: (process: ProcessMetadata) => void | Promise<void>;
 }
@@ -46,6 +50,7 @@ export interface PiJsonParseResult {
   finalAssistantText: string;
   errors: string[];
   parseErrors: string[];
+  metadata: Partial<ResultMetadata>;
 }
 
 function normalizeTimeoutMs(timeoutMs: number | undefined): number | undefined {
@@ -87,6 +92,7 @@ export function parsePiJsonLines(stdout: string): PiJsonParseResult {
   let finalAssistantText = "";
   const errors: string[] = [];
   const parseErrors: string[] = [];
+  const metadata: Partial<ResultMetadata> = {};
 
   for (const [index, line] of stdout.split(/\r?\n/).entries()) {
     if (line.trim().length === 0) continue;
@@ -109,6 +115,10 @@ export function parsePiJsonLines(stdout: string): PiJsonParseResult {
       if (typeof message === "object" && message !== null && (message as Record<string, unknown>).role === "assistant") {
         const assistant = message as Record<string, unknown>;
         finalAssistantText = textFromContent(assistant.content);
+        if (typeof assistant.provider === "string") metadata.provider = assistant.provider;
+        if (typeof assistant.model === "string") metadata.model = assistant.model;
+        if (assistant.usage !== undefined) metadata.usage = assistant.usage;
+        if (typeof assistant.stopReason === "string") metadata.stopReason = assistant.stopReason;
         if (assistant.stopReason === "error") {
           const text = errorText(assistant.errorMessage) ?? errorText(assistant.error) ?? "assistant stopped with an error";
           errors.push(text);
@@ -132,10 +142,11 @@ export function parsePiJsonLines(stdout: string): PiJsonParseResult {
     }
   }
 
-  return { finalAssistantText, errors, parseErrors };
+  return { finalAssistantText, errors, parseErrors, metadata };
 }
 
 function buildPrompt(options: RunHeadlessModelOptions): string {
+  if (options.systemPrompt !== undefined) return options.task;
   const sections = [
     `You are the Pi subagent named ${JSON.stringify(options.agent)}.`,
     options.roleContext ? `Role context:\n${options.roleContext}` : undefined,
@@ -159,16 +170,20 @@ export function buildPiArgv(options: RunHeadlessModelOptions): readonly [string,
   ];
   const model = options.model ?? options.agentDefinition?.model;
   const thinking = options.thinking ?? options.agentDefinition?.thinking;
-  const tools = options.agentDefinition !== undefined ? options.agentDefinition.tools : options.tools;
-  const agentSystemPrompt = options.agentDefinition === undefined ? undefined : buildAgentSystemPrompt(options.agentDefinition);
+  const tools = options.tools ?? options.agentDefinition?.tools;
+  const agentSystemPrompt = options.systemPrompt !== undefined ? undefined : options.agentDefinition === undefined ? undefined : buildAgentSystemPrompt(options.agentDefinition);
 
-  if (agentSystemPrompt !== undefined) {
+  if (options.systemPrompt !== undefined) {
+    argv.push("--system-prompt", options.systemPrompt);
+  } else if (agentSystemPrompt !== undefined) {
     argv.push(options.agentDefinition?.systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt", agentSystemPrompt);
   }
   if (model !== undefined) argv.push("--model", model);
   if (thinking !== undefined) argv.push("--thinking", thinking);
   if (tools !== undefined && tools.length > 0) argv.push("--tools", tools.join(","));
   else if (tools !== undefined) argv.push("--no-tools");
+  for (const skill of options.skills ?? []) argv.push("--skill", skill);
+  for (const extension of options.extensions ?? []) argv.push("--extension", extension);
   argv.push(buildPrompt(options));
   return argv as [string, ...string[]];
 }
@@ -295,7 +310,7 @@ export async function runHeadlessModel(options: RunHeadlessModelOptions): Promis
   const cwd = resolve(options.cwd ?? process.cwd());
   const artifactCwd = resolve(options.artifactCwd ?? cwd);
   const startedAt = new Date();
-  const store = await createTaskArtifactStore({ cwd: artifactCwd, runId: options.runId, taskId: options.taskId, runsDir: options.runsDir });
+  const store = await createAttemptArtifactStore({ cwd: artifactCwd, runId: options.runId, attemptId: options.attemptId, runsDir: options.runsDir });
   const argv = buildPiArgv(options);
   let processResult: ProcessResult;
   try {
@@ -317,6 +332,7 @@ export async function runHeadlessModel(options: RunHeadlessModelOptions): Promis
   const stdoutText = stdout.toString("utf8");
   const stderrText = stderr.toString("utf8");
   const parsed = parsePiJsonLines(stdoutText);
+  const contextLengthExceeded = /context[_ -]?length[_ -]?exceeded|context window|too large/i.test(`${stdoutText}\n${stderrText}`);
 
   let outcome = processOutcome;
   if (processOutcome.status === "completed" && parsed.parseErrors.length > 0 && parsed.finalAssistantText.length === 0) {
@@ -345,5 +361,7 @@ export async function runHeadlessModel(options: RunHeadlessModelOptions): Promis
     exitCode: outcome.exitCode,
     signal: outcome.signal,
     artifacts,
+    correlationId: options.correlationId,
+    metadata: { ...parsed.metadata, contextLengthExceeded },
   });
 }

@@ -14,6 +14,7 @@ export const FAILURE_KINDS = [
   "exit",
   "parse",
   "internal",
+  "stale",
 ] as const;
 export const EXECUTION_MODES = ["single", "parallel"] as const;
 export const ASYNC_DEPENDENCIES = ["needed-before-final", "background", "unclassified"] as const;
@@ -55,6 +56,9 @@ export interface SubagentTaskInput {
   model?: string;
   thinking?: ThinkingLevel;
   tools?: string[];
+  systemPrompt?: string;
+  skills?: string[];
+  extensions?: string[];
 }
 
 export interface ResolveInput {
@@ -80,6 +84,11 @@ export interface ResolveInput {
   model?: string;
   thinking?: ThinkingLevel;
   tools?: string[];
+  systemPrompt?: string;
+  skills?: string[];
+  extensions?: string[];
+  runsDir?: string;
+  correlationId?: string;
 }
 
 export interface ResolveSuccess {

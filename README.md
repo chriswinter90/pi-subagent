@@ -78,11 +78,11 @@ Inject Pi subagent markdown definitions from global or project agent directories
 }
 ```
 
-Agent markdown can live in `~/.pi/agent/agents/*.md` or `.pi/agents/*.md`. Agent-level `tools` declarations control that agent's tool surface. If omitted, Pi's default tools are available.
+Agent markdown can live in `~/.pi/agent/agents/*.md` or `.pi/agents/*.md`. Agent-level `tools` declarations are an authority ceiling; call-level `tools` can narrow them but not expand them. A `systemPrompt` override replaces the agent prompt body, not the agent's frontmatter policy.
 
 ### Type
 
-Use one structured schema for single, parallel, async, and existing-run calls. `action` defaults to `run`.
+Use one structured schema for single, parallel, async, and existing-run calls. `action` defaults to `run`. Each execution is a run; each launch is an attempt.
 
 Single:
 
@@ -93,7 +93,7 @@ Single:
 }
 ```
 
-Parallel:
+Parallel launches independent runs concurrently:
 
 ```json
 {
@@ -113,9 +113,9 @@ Existing run:
 
 ### Panel
 
-Inspect runs, tasks, artifacts, and log tails in a read-only live TUI.
+Inspect runs, attempts, artifacts, and log tails in a live TUI.
 
-Open the read-only run monitor:
+Open the run monitor:
 
 ```text
 /subagent panel

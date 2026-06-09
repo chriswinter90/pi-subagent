@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { chmod, stat, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
-import { createTaskArtifactStore, type ArtifactRef, type ResultEnvelope } from "../artifacts/index.ts";
+import { createAttemptArtifactStore, type ArtifactRef, type ResultEnvelope } from "../artifacts/index.ts";
 import type { ResultWorkspace } from "../artifacts/result.ts";
 import type { FailureKind, SandboxInput, Status } from "../core/constants.ts";
 import { SandboxUnavailableError, withSandboxedArgv } from "../sandbox/srt.ts";
@@ -16,7 +16,7 @@ interface RunTmuxProcessOptions {
   cwd?: string;
   artifactCwd?: string;
   runId?: string;
-  taskId?: string;
+  attemptId?: string;
   runsDir?: string;
   timeoutMs?: number;
   signal?: AbortSignal;
@@ -126,14 +126,14 @@ function workerScript(argv: readonly [string, ...string[]], cwd: string, stdoutP
   return `import { spawn } from "node:child_process";\nimport { appendFileSync, closeSync, openSync, writeFileSync } from "node:fs";\nconst argv = ${JSON.stringify(argv)};\nconst cwd = ${JSON.stringify(cwd)};\nconst stdoutPath = ${JSON.stringify(stdoutPath)};\nconst stderrPath = ${JSON.stringify(stderrPath)};\nconst metaPath = ${JSON.stringify(metaPath)};\ncloseSync(openSync(stdoutPath, "w"));\ncloseSync(openSync(stderrPath, "w"));\nlet settled = false;\nfunction writeMeta(meta) {\n  if (settled) return;\n  settled = true;\n  writeFileSync(metaPath, JSON.stringify(meta, null, 2) + "\\n");\n}\nconst env = { ...process.env };\ndelete env.TMUX;\nconst child = spawn(argv[0], argv.slice(1), { cwd, shell: false, stdio: ["ignore", "pipe", "pipe"], env });\nchild.stdout?.on("data", (chunk) => { appendFileSync(stdoutPath, chunk); process.stdout.write(chunk); });\nchild.stderr?.on("data", (chunk) => { appendFileSync(stderrPath, chunk); process.stderr.write(chunk); });\nchild.on("error", () => { writeMeta({ status: "failed", failureKind: "spawn", exitCode: null, signal: null }); });\nchild.on("close", (exitCode, signal) => {\n  const failureKind = exitCode === 0 ? null : "exit";\n  writeMeta({ status: failureKind === null ? "completed" : "failed", failureKind, exitCode, signal });\n});\n`;
 }
 
-async function runTmuxProcess(options: RunTmuxProcessOptions): Promise<{ result: TmuxRunResult | null; store: Awaited<ReturnType<typeof createTaskArtifactStore>>; cwd: string; artifactCwd: string; startedAt: Date; failure?: WorkerMeta; stderr?: string }> {
+async function runTmuxProcess(options: RunTmuxProcessOptions): Promise<{ result: TmuxRunResult | null; store: Awaited<ReturnType<typeof createAttemptArtifactStore>>; cwd: string; artifactCwd: string; startedAt: Date; failure?: WorkerMeta; stderr?: string }> {
   const argv = options.argv;
   assertRunnableArgv(argv);
   const timeoutMs = normalizeTimeoutMs(options.timeoutMs);
   const cwd = resolve(options.cwd ?? process.cwd());
   const artifactCwd = resolve(options.artifactCwd ?? cwd);
   const startedAt = new Date();
-  const store = await createTaskArtifactStore({ cwd: artifactCwd, runId: options.runId, taskId: options.taskId, runsDir: options.runsDir });
+  const store = await createAttemptArtifactStore({ cwd: artifactCwd, runId: options.runId, attemptId: options.attemptId, runsDir: options.runsDir });
 
   if (!(await tmuxAvailable())) {
     return {
@@ -147,7 +147,7 @@ async function runTmuxProcess(options: RunTmuxProcessOptions): Promise<{ result:
     };
   }
 
-  const sessionName = `pi-subagent-${store.runId}-${store.taskId}`.replace(/[^A-Za-z0-9_-]/g, "-");
+  const sessionName = `pi-subagent-${store.runId}-${store.attemptId}`.replace(/[^A-Za-z0-9_-]/g, "-");
   const stdoutPath = store.pathFor("stdout");
   const stderrPath = store.pathFor("stderr");
   const metaPath = join(store.taskDir, "tmux-worker-meta.json");
@@ -159,7 +159,7 @@ async function runTmuxProcess(options: RunTmuxProcessOptions): Promise<{ result:
   await writeFile(launchPath, `#!/usr/bin/env bash\nset -euo pipefail\nunset TMUX\nexec ${shellQuote(process.execPath)} ${shellQuote(scriptPath)}\n`);
   await chmod(launchPath, 0o700);
 
-  async function runSession(tmuxCommand: string, tmuxArgs: readonly string[], tmuxEnv?: NodeJS.ProcessEnv): Promise<{ result: TmuxRunResult | null; store: Awaited<ReturnType<typeof createTaskArtifactStore>>; cwd: string; artifactCwd: string; startedAt: Date; failure?: WorkerMeta; stderr?: string }> {
+  async function runSession(tmuxCommand: string, tmuxArgs: readonly string[], tmuxEnv?: NodeJS.ProcessEnv): Promise<{ result: TmuxRunResult | null; store: Awaited<ReturnType<typeof createAttemptArtifactStore>>; cwd: string; artifactCwd: string; startedAt: Date; failure?: WorkerMeta; stderr?: string }> {
     let sessionId: string | null = null;
     let paneId: string | null = null;
     try {
@@ -284,11 +284,15 @@ export async function runTmuxModel(options: RunTmuxModelOptions): Promise<Result
       exitCode: failure?.exitCode ?? null,
       signal: failure?.signal ?? null,
       artifacts,
+      correlationId: options.correlationId,
+      metadata: { contextLengthExceeded: /context[_ -]?length[_ -]?exceeded|context window|too large/i.test(stderr ?? "") },
     });
   }
 
   const stdoutText = await import("node:fs/promises").then(({ readFile }) => readFile(store.pathFor("stdout"), "utf8").catch(() => ""));
+  const stderrText = await import("node:fs/promises").then(({ readFile }) => readFile(store.pathFor("stderr"), "utf8").catch(() => ""));
   const parsed = parsePiJsonLines(stdoutText);
+  const contextLengthExceeded = /context[_ -]?length[_ -]?exceeded|context window|too large/i.test(`${stdoutText}\n${stderrText}`);
   let meta = result.meta;
   if (meta.status === "completed" && parsed.parseErrors.length > 0 && parsed.finalAssistantText.length === 0) {
     meta = { ...meta, status: "failed", failureKind: "parse" };
@@ -310,5 +314,7 @@ export async function runTmuxModel(options: RunTmuxModelOptions): Promise<Result
     signal: meta.signal,
     artifacts: [result.stdoutRef, result.stderrRef, outputRef],
     tmux: result.tmux,
+    correlationId: options.correlationId,
+    metadata: { ...parsed.metadata, contextLengthExceeded },
   });
 }

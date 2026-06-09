@@ -12,7 +12,7 @@ const LOG_TAIL_LINES = 5;
 type Filter = "all" | "failed" | "completed";
 
 interface TaskRow {
-  taskId: string;
+  attemptId: string;
   status: Status;
   backend: string;
   failureKind: string | null;
@@ -135,11 +135,11 @@ function statusPriority(status: Status): number {
   return 4;
 }
 
-function aggregateRunStatus(tasks: TaskRow[]): Status {
-  if (tasks.some((task) => task.status === "running")) return "running";
-  if (tasks.some((task) => task.status === "pending")) return "pending";
-  if (tasks.some((task) => task.status === "failed")) return "failed";
-  if (tasks.some((task) => task.status === "cancelled")) return "cancelled";
+function aggregateRunStatus(attempts: TaskRow[]): Status {
+  if (attempts.some((attempt) => attempt.status === "running")) return "running";
+  if (attempts.some((attempt) => attempt.status === "pending")) return "pending";
+  if (attempts.some((attempt) => attempt.status === "failed")) return "failed";
+  if (attempts.some((attempt) => attempt.status === "cancelled")) return "cancelled";
   return "completed";
 }
 
@@ -202,11 +202,17 @@ async function readJson(path: string): Promise<unknown | null> {
 }
 
 function isResultEnvelope(value: unknown): value is ResultEnvelope {
-  return typeof value === "object" && value !== null && typeof (value as { runId?: unknown }).runId === "string" && typeof (value as { taskId?: unknown }).taskId === "string";
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    typeof (value as { runId?: unknown }).runId === "string" &&
+    (typeof (value as { attemptId?: unknown }).attemptId === "string" || typeof (value as { taskId?: unknown }).taskId === "string")
+  );
 }
 
 interface RegistryTaskRecord {
-  taskId: string;
+  attemptId?: string;
+  taskId?: string;
   status: Status;
   backend?: string;
   failureKind?: string | null;
@@ -230,11 +236,17 @@ interface RegistryRunRecord {
   startedAt: string;
   updatedAt: string;
   completedAt: string | null;
-  tasks: RegistryTaskRecord[];
+  attempts?: RegistryTaskRecord[];
+  tasks?: RegistryTaskRecord[];
 }
 
 function isRegistryRunRecord(value: unknown): value is RegistryRunRecord {
-  return typeof value === "object" && value !== null && typeof (value as { runId?: unknown }).runId === "string" && Array.isArray((value as { tasks?: unknown }).tasks);
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    typeof (value as { runId?: unknown }).runId === "string" &&
+    (Array.isArray((value as { attempts?: unknown }).attempts) || Array.isArray((value as { tasks?: unknown }).tasks))
+  );
 }
 
 async function readLogTail(cwd: string, result: ResultEnvelope): Promise<{ path: string | null; tail: string[] }> {
@@ -260,7 +272,7 @@ async function readTask(cwd: string, resultPath: string, _mtimeMs: number): Prom
   if (!isResultEnvelope(parsed)) return null;
   const log = await readLogTail(cwd, parsed);
   return {
-    taskId: parsed.taskId,
+    attemptId: parsed.attemptId ?? parsed.taskId ?? "unknown",
     status: parsed.status,
     backend: parsed.backend,
     failureKind: parsed.failureKind,
@@ -299,7 +311,7 @@ async function readTaskFromRegistry(cwd: string, task: RegistryTaskRecord): Prom
   }
   const log = await readTailFromRegistryPath(task);
   return {
-    taskId: task.taskId,
+    attemptId: task.attemptId ?? task.taskId ?? "unknown",
     status: task.status,
     backend: task.backend ?? "unknown",
     failureKind: task.failureKind ?? null,
@@ -328,9 +340,10 @@ async function loadRuns(cwd: string, filter: Filter): Promise<PanelSnapshot> {
     if (isRegistryRunRecord(registry)) {
       const eventsText = await readFile(join(runDir, "events.jsonl"), "utf8").catch(() => "");
       const eventTail = eventsText.split(/\r?\n/).filter(Boolean).slice(-LOG_TAIL_LINES);
-      const tasks = await Promise.all(registry.tasks.map((task) => readTaskFromRegistry(cwd, task)));
+      const records = registry.attempts ?? registry.tasks ?? [];
+      const tasks = await Promise.all(records.map((task) => readTaskFromRegistry(cwd, task)));
       if (tasks.length === 0) continue;
-      tasks.sort((a, b) => a.taskId.localeCompare(b.taskId, undefined, { numeric: true }));
+      tasks.sort((a, b) => a.attemptId.localeCompare(b.attemptId, undefined, { numeric: true }));
       runs.push({
         runId: registry.runId,
         status: registry.status,
@@ -346,11 +359,14 @@ async function loadRuns(cwd: string, filter: Filter): Promise<PanelSnapshot> {
     }
 
     const taskEntries = await readdir(runDir, { withFileTypes: true }).catch(() => []);
+    const attemptEntries = await readdir(join(runDir, "attempts"), { withFileTypes: true }).catch(() => []);
+    const candidates = [
+      ...attemptEntries.filter((entry) => entry.isDirectory()).map((entry) => join(runDir, "attempts", entry.name, "result.json")),
+      ...taskEntries.filter((entry) => entry.isDirectory() && entry.name !== "attempts").map((entry) => join(runDir, entry.name, "result.json")),
+    ];
     const tasks: TaskRow[] = [];
     let updatedMs = 0;
-    for (const taskEntry of taskEntries) {
-      if (!taskEntry.isDirectory()) continue;
-      const resultPath = join(runDir, taskEntry.name, "result.json");
+    for (const resultPath of candidates) {
       const resultStat = await stat(resultPath).catch(() => null);
       if (resultStat === null) continue;
       updatedMs = Math.max(updatedMs, resultStat.mtimeMs);
@@ -358,7 +374,7 @@ async function loadRuns(cwd: string, filter: Filter): Promise<PanelSnapshot> {
       if (task !== null) tasks.push(task);
     }
     if (tasks.length === 0) continue;
-    tasks.sort((a, b) => a.taskId.localeCompare(b.taskId, undefined, { numeric: true }));
+    tasks.sort((a, b) => a.attemptId.localeCompare(b.attemptId, undefined, { numeric: true }));
     const status = aggregateRunStatus(tasks);
     runs.push({
       runId: runEntry.name,
@@ -564,9 +580,9 @@ export class SubagentPanel implements Component {
     field("Path", safeRelative(this.cwd, task.workspace));
     field("Worktree", task.worktreePath === null ? "—" : safeRelative(this.cwd, task.worktreePath));
 
-    section("TASKS");
+    section("ATTEMPTS");
     for (const candidate of run.tasks) {
-      field("Task", `${candidate.taskId} · ${statusLabel(candidate.status)} · ${fmtElapsed(candidate.startedAt, candidate.completedAt)}${candidate.modelLabel ? ` · ${candidate.modelLabel}` : ""}`, statusColor(candidate.status));
+      field("Attempt", `${candidate.attemptId} · ${statusLabel(candidate.status)} · ${fmtElapsed(candidate.startedAt, candidate.completedAt)}${candidate.modelLabel ? ` · ${candidate.modelLabel}` : ""}`, statusColor(candidate.status));
       field("Result", candidate.resultPath);
       field("Log", candidate.logPath ?? "—");
       field("Started", candidate.startedAt);
@@ -574,7 +590,7 @@ export class SubagentPanel implements Component {
       if (candidate.failureKind !== null) field("Failure", candidate.failureKind, "error");
     }
 
-    section(`LOG TAIL (${task.taskId})`);
+    section(`LOG TAIL (${task.attemptId})`);
     field("Source", task.logPath ?? task.resultPath);
     const tail = task.logTail.length > 0 ? task.logTail : ["No log output yet."];
     for (const logLine of tail) lines.push(`${style(this.theme, "dim", "›")} ${clip(logLine, Math.max(1, width - 2))}`);

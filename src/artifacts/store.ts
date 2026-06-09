@@ -11,7 +11,6 @@ import {
 } from "./result.ts";
 
 const DEFAULT_RUNS_DIR = ".pi/agent/runs";
-const DEFAULT_TASK_ID = "task-1";
 const SAFE_ID_PATTERN = /^[A-Za-z0-9._-]+$/;
 
 const ARTIFACT_FILENAMES: Record<ArtifactType, string> = {
@@ -19,35 +18,46 @@ const ARTIFACT_FILENAMES: Record<ArtifactType, string> = {
   stdout: "stdout.log",
   stderr: "stderr.log",
   output: "output.log",
+  worker: "worker.json",
   "worktree-status": "worktree.status.txt",
   "worktree-diff": "worktree.diff.patch",
 };
 
-export type LogArtifactType = Exclude<ArtifactType, "result">;
+export type LogArtifactType = Exclude<ArtifactType, "result" | "worker">;
 
-export interface CreateTaskArtifactStoreOptions {
+export interface CreateAttemptArtifactStoreOptions {
   cwd?: string;
   runId?: string;
-  taskId?: string;
+  attemptId?: string;
   runsDir?: string;
+  /** @deprecated v1 compatibility only; mapped to attemptId when attemptId is absent. */
+  taskId?: string;
 }
 
-export type StoreResultEnvelopeInput = Omit<ResultEnvelopeInput, "runId" | "taskId"> &
-  Partial<Pick<ResultEnvelopeInput, "runId" | "taskId">>;
+export type StoreResultEnvelopeInput = Omit<ResultEnvelopeInput, "runId" | "attemptId"> &
+  Partial<Pick<ResultEnvelopeInput, "runId" | "attemptId">>;
 
-export interface TaskArtifactStore {
+export interface AttemptArtifactStore {
   runId: string;
-  taskId: string;
+  attemptId: string;
   cwd: string;
   runsDir: string;
   runDir: string;
-  taskDir: string;
+  attemptsDir: string;
+  attemptDir: string;
   pathFor(type: ArtifactType): string;
   refFor(type: ArtifactType, bytes?: number): ArtifactRef;
   writeTextArtifact(type: LogArtifactType, content: string | Uint8Array): Promise<ArtifactRef>;
   appendTextArtifact(type: LogArtifactType, content: string | Uint8Array): Promise<ArtifactRef>;
   writeResult(input: StoreResultEnvelopeInput): Promise<ResultEnvelope>;
+  /** @deprecated v1 compatibility only. */
+  taskId: string;
+  /** @deprecated v1 compatibility only. */
+  taskDir: string;
 }
+
+export type CreateTaskArtifactStoreOptions = CreateAttemptArtifactStoreOptions;
+export type TaskArtifactStore = AttemptArtifactStore;
 
 function assertSafeId(name: string, value: string): void {
   if (!SAFE_ID_PATTERN.test(value)) {
@@ -81,13 +91,17 @@ export function createRunId(now: Date = new Date()): string {
   return `run_${now.getTime().toString(36)}_${randomBytes(3).toString("hex")}`;
 }
 
-export async function createTaskArtifactStore(options: CreateTaskArtifactStoreOptions = {}): Promise<TaskArtifactStore> {
+export function createAttemptId(now: Date = new Date()): string {
+  return `attempt_${now.getTime().toString(36)}_${randomBytes(3).toString("hex")}`;
+}
+
+export async function createAttemptArtifactStore(options: CreateAttemptArtifactStoreOptions = {}): Promise<AttemptArtifactStore> {
   const cwd = resolve(options.cwd ?? process.cwd());
   const runId = options.runId ?? createRunId();
-  const taskId = options.taskId ?? DEFAULT_TASK_ID;
+  const attemptId = options.attemptId ?? options.taskId ?? createAttemptId();
 
   assertSafeId("runId", runId);
-  assertSafeId("taskId", taskId);
+  assertSafeId("attemptId", attemptId);
 
   const runsDir = resolve(cwd, options.runsDir ?? DEFAULT_RUNS_DIR);
   if (!isInsideOrEqual(cwd, runsDir)) {
@@ -95,11 +109,12 @@ export async function createTaskArtifactStore(options: CreateTaskArtifactStoreOp
   }
 
   const runDir = join(runsDir, runId);
-  const taskDir = join(runDir, taskId);
-  await mkdir(taskDir, { recursive: true });
+  const attemptsDir = join(runDir, "attempts");
+  const attemptDir = join(attemptsDir, attemptId);
+  await mkdir(attemptDir, { recursive: true });
 
   function pathFor(type: ArtifactType): string {
-    return join(taskDir, ARTIFACT_FILENAMES[type]);
+    return join(attemptDir, ARTIFACT_FILENAMES[type]);
   }
 
   function refFor(type: ArtifactType, bytes?: number): ArtifactRef {
@@ -124,7 +139,7 @@ export async function createTaskArtifactStore(options: CreateTaskArtifactStoreOp
     const result = createResultEnvelope({
       ...input,
       runId: input.runId ?? runId,
-      taskId: input.taskId ?? taskId,
+      attemptId: input.attemptId ?? attemptId,
       artifacts: mergeArtifactRefs(input.artifacts ?? [], [refFor("result")]),
     });
     const resultPath = pathFor("result");
@@ -136,15 +151,23 @@ export async function createTaskArtifactStore(options: CreateTaskArtifactStoreOp
 
   return {
     runId,
-    taskId,
+    attemptId,
     cwd,
     runsDir,
     runDir,
-    taskDir,
+    attemptsDir,
+    attemptDir,
     pathFor,
     refFor,
     writeTextArtifact,
     appendTextArtifact,
     writeResult,
+    taskId: attemptId,
+    taskDir: attemptDir,
   };
+}
+
+/** @deprecated Use createAttemptArtifactStore. */
+export async function createTaskArtifactStore(options: CreateTaskArtifactStoreOptions = {}): Promise<TaskArtifactStore> {
+  return await createAttemptArtifactStore(options);
 }

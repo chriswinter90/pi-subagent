@@ -4,7 +4,7 @@ import { createRequire } from "node:module";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { buildAgentSystemPrompt, type AgentDefinition } from "../agents.ts";
-import { createTaskArtifactStore, type ArtifactRef, type ResultEnvelope } from "../artifacts/index.ts";
+import { createAttemptArtifactStore, type ArtifactRef, type ResultEnvelope } from "../artifacts/index.ts";
 import type { ResultWorkspace } from "../artifacts/result.ts";
 import { THINKING_LEVELS, type AgentScope, type FailureKind, type ThinkingLevel } from "../core/constants.ts";
 
@@ -17,14 +17,18 @@ export interface RunInlineModelOptions {
   cwd?: string;
   artifactCwd?: string;
   runId?: string;
-  taskId?: string;
+  attemptId?: string;
   runsDir?: string;
+  correlationId?: string;
   timeoutMs?: number;
   signal?: AbortSignal;
   workspace?: Partial<ResultWorkspace>;
   model?: string;
   thinking?: ThinkingLevel;
   tools?: string[];
+  systemPrompt?: string;
+  skills?: string[];
+  extensions?: string[];
   agentDefinition?: AgentDefinition;
 }
 
@@ -188,6 +192,7 @@ async function resolveRequestedModel(modelRegistry: ModelRegistryLike, modelRefe
 }
 
 function buildPrompt(options: RunInlineModelOptions): string {
+  if (options.systemPrompt !== undefined) return options.task;
   const sections = [
     `You are the Pi subagent named ${JSON.stringify(options.agent)}.`,
     "You are running as an inline child session. Do not spawn subagents or delegate to unmanaged child agents.",
@@ -208,10 +213,10 @@ function createChildResourceLoader(piSdk: PiSdkModule, options: RunInlineModelOp
   ]
     .filter((section): section is string => section !== undefined)
     .join("\n\n");
-  const agentSystemPrompt = options.agentDefinition === undefined ? undefined : buildAgentSystemPrompt(options.agentDefinition);
+  const agentSystemPrompt = options.systemPrompt !== undefined ? options.systemPrompt : options.agentDefinition === undefined ? undefined : buildAgentSystemPrompt(options.agentDefinition);
   const systemPrompt = agentSystemPrompt === undefined
     ? baseSystemPrompt
-    : options.agentDefinition?.systemPromptMode === "replace"
+    : options.systemPrompt !== undefined || options.agentDefinition?.systemPromptMode === "replace"
       ? agentSystemPrompt
       : `${baseSystemPrompt}\n\n${agentSystemPrompt}`;
 
@@ -269,7 +274,7 @@ export async function runInlineModel(options: RunInlineModelOptions): Promise<Re
   const cwd = resolve(options.cwd ?? process.cwd());
   const artifactCwd = resolve(options.artifactCwd ?? cwd);
   const startedAt = new Date();
-  const store = await createTaskArtifactStore({ cwd: artifactCwd, runId: options.runId, taskId: options.taskId, runsDir: options.runsDir });
+  const store = await createAttemptArtifactStore({ cwd: artifactCwd, runId: options.runId, attemptId: options.attemptId, runsDir: options.runsDir });
 
   let stdoutText = "";
   let stderrText = "";
@@ -287,7 +292,7 @@ export async function runInlineModel(options: RunInlineModelOptions): Promise<Re
     const requestedThinking = options.thinking ?? options.agentDefinition?.thinking;
     const model = requestedModel === undefined ? undefined : await resolveRequestedModel(modelRegistry, requestedModel);
     const modelThinking = requestedModel === undefined ? undefined : splitThinkingSuffix(requestedModel).thinking;
-    const tools = options.agentDefinition !== undefined ? options.agentDefinition.tools : options.tools;
+    const tools = options.tools ?? options.agentDefinition?.tools;
 
     const { session, diagnostics = [] } = await piSdk.createAgentSession({
       cwd,
@@ -347,5 +352,7 @@ export async function runInlineModel(options: RunInlineModelOptions): Promise<Re
     exitCode: null,
     signal: failureKind === "abort" ? "ABORT" : null,
     artifacts,
+    correlationId: options.correlationId,
+    metadata: { contextLengthExceeded: /context[_ -]?length[_ -]?exceeded|context window|too large/i.test(`${stdoutText}\n${stderrText}`) },
   });
 }

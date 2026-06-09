@@ -107,19 +107,23 @@ function validateThinkingAliases(value: Record<string, unknown>, fieldName: stri
   return first;
 }
 
-function validateTools(value: unknown, fieldName: string, backend: ResolvedBackend | undefined): string[] | ResolveValidationResult {
+function validateStringArray(value: unknown, fieldName: string, backend: ResolvedBackend | undefined): string[] | ResolveValidationResult {
   if (!Array.isArray(value)) {
-    return failure(`${fieldName} must be an array of non-empty strings when provided. Use [] to disable tools for that run.`, backend);
+    return failure(`${fieldName} must be an array of non-empty strings when provided.`, backend);
   }
 
-  const tools: string[] = [];
+  const items: string[] = [];
   for (const [index, entry] of value.entries()) {
     if (typeof entry !== "string" || entry.length === 0) {
       return failure(`${fieldName}[${index}] must be a non-empty string.`, backend);
     }
-    tools.push(entry);
+    items.push(entry);
   }
-  return Array.from(new Set(tools));
+  return Array.from(new Set(items));
+}
+
+function validateTools(value: unknown, fieldName: string, backend: ResolvedBackend | undefined): string[] | ResolveValidationResult {
+  return validateStringArray(value, fieldName, backend);
 }
 
 function validateSandbox(value: unknown, fieldName: string, backend: ResolvedBackend | undefined): SandboxInput | null | ResolveValidationResult {
@@ -201,6 +205,24 @@ function validateTaskItem(value: unknown, fieldName: string, backend: ResolvedBa
     const tools = validateTools(value.tools, `${fieldName}.tools`, backend);
     if (!Array.isArray(tools)) return tools;
     task.tools = tools;
+  }
+
+  if (value.systemPrompt !== undefined) {
+    const systemPrompt = validateString(value.systemPrompt, `${fieldName}.systemPrompt`, backend);
+    if (typeof systemPrompt !== "string") return systemPrompt;
+    task.systemPrompt = systemPrompt;
+  }
+
+  if (value.skills !== undefined) {
+    const skills = validateStringArray(value.skills, `${fieldName}.skills`, backend);
+    if (!Array.isArray(skills)) return skills;
+    task.skills = skills;
+  }
+
+  if (value.extensions !== undefined) {
+    const extensions = validateStringArray(value.extensions, `${fieldName}.extensions`, backend);
+    if (!Array.isArray(extensions)) return extensions;
+    task.extensions = extensions;
   }
 
   const thinking = validateThinkingAliases(value, fieldName, backend);
@@ -365,6 +387,18 @@ export function validateResolveInput(raw: unknown = {}): ResolveValidationResult
     input.cwd = cwd;
   }
 
+  if (raw.runsDir !== undefined) {
+    const runsDir = validateString(raw.runsDir, "runsDir", backendForKnownFailure);
+    if (typeof runsDir !== "string") return runsDir;
+    input.runsDir = runsDir;
+  }
+
+  if (raw.correlationId !== undefined) {
+    const correlationId = validateString(raw.correlationId, "correlationId", backendForKnownFailure);
+    if (typeof correlationId !== "string") return correlationId;
+    input.correlationId = correlationId;
+  }
+
   if (raw.async !== undefined) {
     const asyncValue = validateBoolean(raw.async, "async", backendForKnownFailure);
     if (typeof asyncValue !== "boolean") return asyncValue;
@@ -401,6 +435,24 @@ export function validateResolveInput(raw: unknown = {}): ResolveValidationResult
     const tools = validateTools(raw.tools, "tools", backendForKnownFailure);
     if (!Array.isArray(tools)) return tools;
     input.tools = tools;
+  }
+
+  if (raw.systemPrompt !== undefined) {
+    const systemPrompt = validateString(raw.systemPrompt, "systemPrompt", backendForKnownFailure);
+    if (typeof systemPrompt !== "string") return systemPrompt;
+    input.systemPrompt = systemPrompt;
+  }
+
+  if (raw.skills !== undefined) {
+    const skills = validateStringArray(raw.skills, "skills", backendForKnownFailure);
+    if (!Array.isArray(skills)) return skills;
+    input.skills = skills;
+  }
+
+  if (raw.extensions !== undefined) {
+    const extensions = validateStringArray(raw.extensions, "extensions", backendForKnownFailure);
+    if (!Array.isArray(extensions)) return extensions;
+    input.extensions = extensions;
   }
 
   const thinking = validateThinkingAliases(raw, "input", backendForKnownFailure);

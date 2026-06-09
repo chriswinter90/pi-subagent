@@ -4,8 +4,9 @@ import type { ResultEnvelope } from "./artifacts/index.ts";
 import type { ExecutionMode, ResolveInput, ResolvedBackend } from "./core/constants.ts";
 import { resolveBackend } from "./core/resolver.ts";
 import { validateResolveInput } from "./core/validation.ts";
-import { startAsyncSubagentRun } from "./orchestrate/async.ts";
+import { startAsyncParallelSubagentRuns, startAsyncSubagentRun } from "./orchestrate/async.ts";
 import { interruptRun, type InterruptRunOptions, type InterruptRunResult } from "./orchestrate/interrupt.ts";
+import { reconcileSubagentRun as reconcileRun, type ReconcileSubagentRunOptions as ReconcileRunOptions, type ReconcileSubagentRunResult } from "./orchestrate/reconcile.ts";
 import { runParallelSubagentTasks, runSubagentTask, type ParallelRunResult } from "./orchestrate/run.ts";
 import {
   getRunLogs,
@@ -28,6 +29,7 @@ export type GetSubagentStatusOptions = RunStatusRef;
 export type GetSubagentLogsOptions = RunStatusRef;
 export type WaitForSubagentOptions = WaitForRunOptions;
 export type InterruptSubagentOptions = InterruptRunOptions;
+export type ReconcileSubagentOptions = ReconcileRunOptions;
 
 export class SubagentValidationError extends Error {
   readonly failureKind = "validation" as const;
@@ -132,15 +134,24 @@ export async function runSubagent(options: RunSubagentOptions): Promise<RunSubag
   const { input, cwd, backend, signal } = validateRunOptions(options);
   await assertProjectAgentApproval(input, cwd);
 
-  if (input.async === true || input.onComplete === "detach" || input.onComplete === "notify") {
-    return await startAsyncSubagentRun({ input, cwd, backend, signal });
-  }
+  try {
+    const mode = executionMode(input);
+    const asyncRequested = input.async === true || input.onComplete === "detach" || input.onComplete === "notify";
+    if (mode === "parallel") {
+      return asyncRequested ? await startAsyncParallelSubagentRuns(input, cwd, signal) : await runParallelSubagentTasks(input, cwd, signal);
+    }
 
-  if (executionMode(input) === "parallel") {
-    return await runParallelSubagentTasks(input, cwd, signal);
-  }
+    if (asyncRequested) {
+      return await startAsyncSubagentRun({ input, cwd, backend, signal });
+    }
 
-  return await runSubagentTask({ input, cwd, signal });
+    return await runSubagentTask({ input, cwd, signal });
+  } catch (error) {
+    if (typeof error === "object" && error !== null && (error as { failureKind?: unknown }).failureKind === "validation") {
+      throw new SubagentValidationError(error instanceof Error ? error.message : String(error));
+    }
+    throw error;
+  }
 }
 
 export async function getSubagentStatus(options: GetSubagentStatusOptions): Promise<RunStatusSnapshot | null> {
@@ -159,6 +170,10 @@ export async function interruptSubagent(options: InterruptSubagentOptions): Prom
   return await interruptRun(options);
 }
 
+export async function reconcileSubagentRun(options: ReconcileSubagentOptions): Promise<ReconcileSubagentRunResult> {
+  return await reconcileRun(options);
+}
+
 export type {
   ArtifactRef,
   CompletionMetadata,
@@ -170,5 +185,6 @@ export type {
 } from "./artifacts/index.ts";
 export type { AsyncDependency, Backend, ExecutionMode, FailureKind, ResolvedBackend, Status } from "./core/constants.ts";
 export type { InterruptRunResult } from "./orchestrate/interrupt.ts";
+export type { ReconcileSubagentRunResult } from "./orchestrate/reconcile.ts";
 export type { ParallelRunResult } from "./orchestrate/run.ts";
 export type { RunLogRef, RunLogsSnapshot, RunStatusRef, RunStatusSnapshot, RunTaskStatusSnapshot, WaitForRunResult } from "./orchestrate/status.ts";

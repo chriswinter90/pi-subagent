@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { mkdir } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { promisify } from "node:util";
-import { createTaskArtifactStore, type ArtifactRef, type ResultEnvelope } from "../artifacts/index.ts";
+import { createAttemptArtifactStore, type ArtifactRef, type ResultEnvelope } from "../artifacts/index.ts";
 import type { ResolveInput, WorkspaceMode, WorktreePolicy } from "../core/constants.ts";
 
 const execFileAsync = promisify(execFile);
@@ -90,8 +90,8 @@ async function gitRoot(cwd: string): Promise<string> {
 
 function defaultWorktreePath(root: string, runId: string | undefined, taskIndex: number | undefined): string {
   const safeRunId = (runId ?? `run-${Date.now().toString(36)}`).replace(/[^A-Za-z0-9._-]/g, "-");
-  const safeTask = `task-${(taskIndex ?? 0) + 1}`;
-  return join(dirname(root), ".pi-subagent-worktrees", `${root.split(/[\\/]/).pop() ?? "repo"}-${safeRunId}-${safeTask}`);
+  const safeSlot = `slot-${(taskIndex ?? 0) + 1}`;
+  return join(dirname(root), ".pi-subagent-worktrees", `${root.split(/[\\/]/).pop() ?? "repo"}-${safeRunId}-${safeSlot}`);
 }
 
 export async function resolveWorkspace(options: WorkspaceResolutionInput): Promise<ResolvedWorkspace> {
@@ -124,7 +124,7 @@ async function gitOutputAllowFailure(cwd: string, args: readonly string[]): Prom
 }
 
 async function captureWorktreeArtifacts(result: ResultEnvelope, worktreePath: string): Promise<ArtifactRef[]> {
-  const store = await createTaskArtifactStore({ cwd: result.cwd, runId: result.runId, taskId: result.taskId });
+  const store = await createAttemptArtifactStore({ cwd: result.cwd, runId: result.runId, attemptId: result.attemptId });
   await gitOutputAllowFailure(worktreePath, ["add", "-N", "--", "."]);
   const status = await gitOutputAllowFailure(worktreePath, ["status", "--short"]);
   const diffStat = await gitOutputAllowFailure(worktreePath, ["diff", "--stat", "--", "."]);
@@ -138,7 +138,7 @@ async function captureWorktreeArtifacts(result: ResultEnvelope, worktreePath: st
 export async function finalizeWorktreeResult(workspace: ResolvedWorkspace, result: ResultEnvelope): Promise<ResultEnvelope> {
   if (workspace.mode !== "worktree" || workspace.worktreePath === null) return result;
 
-  const store = await createTaskArtifactStore({ cwd: result.cwd, runId: result.runId, taskId: result.taskId });
+  const store = await createAttemptArtifactStore({ cwd: result.cwd, runId: result.runId, attemptId: result.attemptId });
   const artifacts = [...result.artifacts];
   let cleanupStatus: "removed" | "kept" | "failed" = result.status === "completed" ? "removed" : "kept";
   let cleanupError: string | undefined;
@@ -184,5 +184,7 @@ export async function finalizeWorktreeResult(workspace: ResolvedWorkspace, resul
     artifacts,
     tmux: result.tmux,
     completion: result.completion,
+    correlationId: result.correlationId,
+    metadata: result.metadata,
   });
 }

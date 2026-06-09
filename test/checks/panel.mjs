@@ -33,16 +33,17 @@ async function waitFor(predicate, label) {
   throw new Error(`Timed out waiting for ${label}`);
 }
 
-async function writeRun(cwd, runId, taskId, options) {
-  const taskDir = join(cwd, ".pi/agent/runs", runId, taskId);
-  await mkdir(taskDir, { recursive: true });
-  const outputRel = `.pi/agent/runs/${runId}/${taskId}/output.log`;
-  const resultRel = `.pi/agent/runs/${runId}/${taskId}/result.json`;
+async function writeRun(cwd, runId, attemptId, options) {
+  const attemptDir = join(cwd, ".pi/agent/runs", runId, "attempts", attemptId);
+  await mkdir(attemptDir, { recursive: true });
+  const outputRel = `.pi/agent/runs/${runId}/attempts/${attemptId}/output.log`;
+  const resultRel = `.pi/agent/runs/${runId}/attempts/${attemptId}/result.json`;
   await writeFile(join(cwd, outputRel), `${options.log}\n`);
   const result = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     runId,
-    taskId,
+    attemptId,
+    taskId: attemptId,
     backend: options.backend ?? "headless",
     status: options.status,
     failureKind: options.failureKind ?? null,
@@ -54,6 +55,7 @@ async function writeRun(cwd, runId, taskId, options) {
     sandbox: { enabled: false },
     exitCode: options.status === "failed" ? 1 : 0,
     signal: null,
+    metadata: { contextLengthExceeded: false },
     artifacts: [
       { type: "output", path: outputRel },
       { type: "result", path: resultRel },
@@ -88,9 +90,9 @@ async function main() {
   const singleCallText = renderText(registeredTool.renderCall({ agent: "reviewer", task: "Review clipboard image paste behavior", async: true }, callTheme), 120);
   assert.match(singleCallText, /subagent run · single · reviewer · Review clipboard image paste behavior · async/);
   const parallelCallText = renderText(registeredTool.renderCall({ mode: "parallel", tasks: [{ task: "a" }, { task: "b" }], onComplete: "notify" }, callTheme), 120);
-  assert.match(parallelCallText, /subagent run · parallel · 2 tasks · notify/);
-  const statusCallText = renderText(registeredTool.renderCall({ action: "status", runId: "run_example", taskId: "task-1" }, callTheme), 120);
-  assert.match(statusCallText, /subagent status · run_example · task-1/);
+  assert.match(parallelCallText, /subagent run · parallel · 2 runs · notify/);
+  const statusCallText = renderText(registeredTool.renderCall({ action: "status", runId: "run_example", attemptId: "attempt-1" }, callTheme), 120);
+  assert.match(statusCallText, /subagent status · run_example · attempt-1/);
   assert.ok(registeredCommand, "subagent command should register");
   assert.equal(registeredCommand.name, "subagent");
   assert.equal(typeof registeredCommand.handler, "function");
@@ -157,13 +159,13 @@ async function main() {
     empty.component.handleInput("q");
     assert.equal(empty.closeCount(), 1, "q should close empty panel");
 
-    await writeRun(cwd, "run_active", "task-1", { status: "running", backend: "headless", log: "active task one latest" });
-    await writeRun(cwd, "run_active", "task-2", { status: "completed", backend: "headless", log: "active task two result" });
-    await writeRun(cwd, "run_queued", "task-1", { status: "pending", backend: "headless", log: "queued waiting slot", completedAt: null });
-    await writeRun(cwd, "run_done", "task-1", { status: "completed", backend: "tmux", log: "done result ready" });
-    await writeRun(cwd, "run_failed", "task-1", { status: "failed", backend: "inline", failureKind: "timeout", log: "failed timeout tail" });
+    await writeRun(cwd, "run_active", "attempt-1", { status: "running", backend: "headless", log: "active attempt one latest" });
+    await writeRun(cwd, "run_active", "attempt-2", { status: "completed", backend: "headless", log: "active attempt two result" });
+    await writeRun(cwd, "run_queued", "attempt-1", { status: "pending", backend: "headless", log: "queued waiting slot", completedAt: null });
+    await writeRun(cwd, "run_done", "attempt-1", { status: "completed", backend: "tmux", log: "done result ready" });
+    await writeRun(cwd, "run_failed", "attempt-1", { status: "failed", backend: "inline", failureKind: "timeout", log: "failed timeout tail" });
     for (let index = 0; index < 24; index += 1) {
-      await writeRun(cwd, `run_scroll_${String(index).padStart(2, "0")}`, "task-1", { status: "completed", backend: "headless", log: `scroll run ${index}` });
+      await writeRun(cwd, `run_scroll_${String(index).padStart(2, "0")}`, "attempt-1", { status: "completed", backend: "headless", log: `scroll run ${index}` });
     }
 
     const panel = await runCommand("panel");
@@ -178,14 +180,14 @@ async function main() {
     assert.match(text, /RUN/);
     assert.match(text, /Run ID/);
     assert.match(text, /WORKSPACE/);
-    assert.match(text, /TASKS/);
+    assert.match(text, /ATTEMPTS/);
     assert.match(text, /Result/);
     assert.match(text, /Started/);
     assert.match(text, /Completed/);
     assert.match(text, /LOG TAIL/);
-    assert.match(text, /task-1/);
-    assert.match(text, /task-2/);
-    assert.match(text, /active task one latest/);
+    assert.match(text, /attempt-1/);
+    assert.match(text, /attempt-2/);
+    assert.match(text, /active attempt one latest/);
     assert.match(text, /\[all\]/, "all should be the default filter");
     assert.doesNotMatch(text, /active \+ recent 20/, "recent20 tab should be removed");
     assert.doesNotMatch(text, /\binline\b|\bheadless\b|\btmux\b/, "backend labels should stay hidden in the panel");
@@ -225,7 +227,7 @@ async function main() {
     await waitFor(() => renderText(component).includes("[completed]") && renderText(component).includes("run_scroll_"), "left/completed filter");
 
     const completedRunIds = ["run_done", ...Array.from({ length: 24 }, (_, index) => `run_scroll_${String(index).padStart(2, "0")}`)];
-    await Promise.all(completedRunIds.map((runId) => writeFile(join(cwd, ".pi/agent/runs", runId, "task-1/output.log"), `${runId}\nnew live tail\n`)));
+    await Promise.all(completedRunIds.map((runId) => writeFile(join(cwd, ".pi/agent/runs", runId, "attempts", "attempt-1", "output.log"), `${runId}\nnew live tail\n`)));
     component.handleInput("r");
     await waitFor(() => renderText(component).includes("new live tail"), "manual refresh updates log tail");
 

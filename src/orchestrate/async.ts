@@ -1,6 +1,22 @@
-import { appendRunEvent, beginRunRecord, createRunId, createTaskArtifactStore, finishTaskFromResult, type ResultEnvelope } from "../artifacts/index.ts";
-import type { ExecutionMode, OnCompleteAction, ResolveInput, ResolvedBackend } from "../core/constants.ts";
-import { runParallelSubagentTasks, runSubagentTask } from "./run.ts";
+import { spawn } from "node:child_process";
+import { closeSync, openSync } from "node:fs";
+import { writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+  appendRunEvent,
+  beginRunRecord,
+  createAttemptArtifactStore,
+  createAttemptId,
+  createRunId,
+  finishAttemptFromResult,
+  updateAttemptProcess,
+  type ResultEnvelope,
+} from "../artifacts/index.ts";
+import type { ExecutionMode, ResolveInput, ResolvedBackend, SubagentTaskInput } from "../core/constants.ts";
+import { resolveBackend } from "../core/resolver.ts";
+import { DEFAULT_PARALLEL_CONCURRENCY, MAX_PARALLEL_CONCURRENCY, MAX_PARALLEL_TASKS, SubagentToolAuthorityError, validateBackendResourceSupport, type ParallelRunResult } from "./run.ts";
+import { readRunResult, waitForRun } from "./status.ts";
 
 export interface StartAsyncSubagentRunOptions {
   input: ResolveInput;
@@ -8,16 +24,8 @@ export interface StartAsyncSubagentRunOptions {
   backend: ResolvedBackend;
   signal?: AbortSignal;
   runId?: string;
-  taskId?: string;
+  attemptId?: string;
   onComplete?: (result: ResultEnvelope, mode: ExecutionMode) => number | Promise<number>;
-}
-
-async function notifyCompletion(options: StartAsyncSubagentRunOptions, result: ResultEnvelope, mode: ExecutionMode): Promise<number> {
-  try {
-    return (await options.onComplete?.(result, mode)) ?? 0;
-  } catch {
-    return 0;
-  }
 }
 
 function executionMode(input: ResolveInput): ExecutionMode {
@@ -26,37 +34,96 @@ function executionMode(input: ResolveInput): ExecutionMode {
   return "single";
 }
 
+function parallelConcurrency(input: ResolveInput): number {
+  const requested = input.concurrency ?? DEFAULT_PARALLEL_CONCURRENCY;
+  return Math.max(1, Math.min(MAX_PARALLEL_CONCURRENCY, requested));
+}
+
+function mergeTaskInput(parent: ResolveInput, task: SubagentTaskInput): ResolveInput {
+  return {
+    ...parent,
+    ...task,
+    tasks: undefined,
+    mode: "single",
+    workspace: parent.workspace,
+    worktree: parent.worktree,
+    worktreePolicy: parent.worktreePolicy,
+    concurrency: undefined,
+    asyncDependency: parent.asyncDependency,
+    runsDir: parent.runsDir,
+    correlationId: parent.correlationId,
+  };
+}
+
 function sandboxEnabled(input: ResolveInput): boolean {
   return input.sandbox !== undefined && input.sandbox !== null;
 }
 
-async function annotateCompletion(
-  store: Awaited<ReturnType<typeof createTaskArtifactStore>>,
-  input: ResolveInput,
-  result: ResultEnvelope,
-  updatesSent: number,
-): Promise<ResultEnvelope> {
-  const completion = {
-    onComplete: (input.onComplete ?? null) as OnCompleteAction | null,
-    notified: input.onComplete === "notify",
-    updatesSent,
-  };
-  return await store.writeResult({
-    ...result,
-    completedAt: result.completedAt,
-    artifacts: result.artifacts,
-    completion,
-  });
+function armCompletionMonitor(options: StartAsyncSubagentRunOptions & { runId: string; attemptId: string; mode: ExecutionMode; store: Awaited<ReturnType<typeof createAttemptArtifactStore>> }): void {
+  if (options.onComplete === undefined || options.input.onComplete !== "notify") return;
+  void (async () => {
+    const waited = await waitForRun({ cwd: options.cwd, runsDir: options.input.runsDir, runId: options.runId, attemptId: options.attemptId, timeoutMs: options.input.timeoutMs ?? 86_400_000, pollIntervalMs: 500 });
+    if (waited.status !== "completed") return;
+    const result = await readRunResult({ cwd: options.cwd, runsDir: options.input.runsDir, runId: options.runId, attemptId: options.attemptId });
+    if (result === null) return;
+    const updatesSent = await options.onComplete!(result, options.mode);
+    const completed = await options.store.writeResult({
+      ...result,
+      completion: { onComplete: options.input.onComplete ?? null, notified: true, updatesSent },
+    });
+    await finishAttemptFromResult({ cwd: options.cwd, runsDir: options.input.runsDir, runId: options.runId }, completed);
+  })().catch(() => undefined);
+}
+
+function workerPath(): string {
+  return join(dirname(fileURLToPath(import.meta.url)), "../workers/durable-worker.mjs");
+}
+
+export async function startAsyncParallelSubagentRuns(input: ResolveInput, cwd: string, signal?: AbortSignal, onComplete?: StartAsyncSubagentRunOptions["onComplete"]): Promise<ParallelRunResult> {
+  if (!input.tasks || input.tasks.length === 0) throw new SubagentToolAuthorityError("parallel mode requires a non-empty tasks array.");
+  if (input.tasks.length > MAX_PARALLEL_TASKS) throw new SubagentToolAuthorityError(`too many parallel tasks (${input.tasks.length}); max is ${MAX_PARALLEL_TASKS}.`);
+  for (const [index, task] of input.tasks.entries()) {
+    if (task.task === undefined) throw new SubagentToolAuthorityError(`parallel tasks[${index}] requires a non-empty task.`);
+  }
+
+  const concurrency = Math.min(parallelConcurrency(input), input.tasks.length);
+  const results: ResultEnvelope[] = new Array(input.tasks.length);
+  let nextIndex = 0;
+
+  async function worker(): Promise<void> {
+    while (true) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= input.tasks!.length) return;
+      const taskInput = mergeTaskInput(input, input.tasks![index]);
+      const resolved = resolveBackend(taskInput);
+      if (resolved.status === "failed") throw new SubagentToolAuthorityError(resolved.error);
+      validateBackendResourceSupport(taskInput, resolved.backend);
+      results[index] = await startAsyncSubagentRun({ input: taskInput, cwd: taskInput.cwd ?? cwd, backend: resolved.backend, signal, onComplete });
+    }
+  }
+
+  await Promise.all(Array.from({ length: concurrency }, () => worker()));
+  return { mode: "parallel", runIds: results.map((result) => result.runId), results, concurrency };
 }
 
 export async function startAsyncSubagentRun(options: StartAsyncSubagentRunOptions): Promise<ResultEnvelope> {
   const input = options.input;
   const startedAt = new Date();
   const runId = options.runId ?? createRunId(startedAt);
-  const taskId = options.taskId ?? "task-1";
+  const attemptId = options.attemptId ?? createAttemptId(startedAt);
   const mode = executionMode(input);
+  if (mode === "parallel") {
+    throw new SubagentToolAuthorityError("startAsyncSubagentRun handles one run; use startAsyncParallelSubagentRuns for parallel inputs.");
+  }
+  validateBackendResourceSupport(input, options.backend);
   const dependency = input.asyncDependency ?? "unclassified";
-  const store = await createTaskArtifactStore({ cwd: options.cwd, runId, taskId });
+  const store = await createAttemptArtifactStore({ cwd: options.cwd, runId, attemptId, runsDir: input.runsDir });
+  const payloadPath = store.pathFor("worker");
+  const payloadText = `${JSON.stringify({ input, cwd: options.cwd, backend: options.backend, runId, attemptId, startedAt: startedAt.toISOString() }, null, 2)}\n`;
+  await writeFile(payloadPath, payloadText);
+  const workerRef = store.refFor("worker", Buffer.byteLength(payloadText, "utf8"));
+
   const running = await store.writeResult({
     backend: options.backend,
     status: "running",
@@ -68,53 +135,54 @@ export async function startAsyncSubagentRun(options: StartAsyncSubagentRunOption
     sandbox: { enabled: sandboxEnabled(input) },
     exitCode: null,
     signal: null,
-    artifacts: [],
+    artifacts: [workerRef],
+    correlationId: input.correlationId,
+    metadata: { contextLengthExceeded: false },
   });
+
   await beginRunRecord({
     cwd: options.cwd,
+    runsDir: input.runsDir,
     runId,
-    mode,
+    mode: mode === "parallel" ? "parallel" : "single",
     backend: options.backend,
     startedAt,
     dependency,
-    aggregateTaskId: mode === "parallel" ? taskId : null,
-    tasks: [{ taskId, status: "running", backend: options.backend }],
+    correlationId: input.correlationId,
+    activeAttemptId: attemptId,
+    attempts: [{ attemptId, status: "running", backend: options.backend, startedAt: startedAt.toISOString(), artifactCwd: options.cwd, resultPath: running.artifacts.find((artifact) => artifact.type === "result")?.path }],
   });
-  await appendRunEvent({ cwd: options.cwd, runId }, { type: "run.started", status: "running", message: `${mode} async run started`, data: { dependency } });
+  await appendRunEvent({ cwd: options.cwd, runsDir: input.runsDir, runId }, { type: "run.started", status: "running", message: `${mode} durable async run started`, data: { dependency, attemptId } });
 
-  void (async () => {
-    if (mode === "parallel") {
-      const parallel = await runParallelSubagentTasks(input, options.cwd, options.signal, { runId, taskIdOffset: 1 });
-      const updatesSent = await notifyCompletion(options, parallel.aggregate, mode);
-      await annotateCompletion(store, input, parallel.aggregate, updatesSent);
-      return;
-    }
-
-    const result = await runSubagentTask({ input, cwd: options.cwd, signal: options.signal, runId, taskId, runMode: mode });
-    const updatesSent = await notifyCompletion(options, result, mode);
-    await annotateCompletion(store, input, result, updatesSent);
-  })().catch(async (error) => {
-    const message = error instanceof Error ? error.message : String(error);
-    const stderr = await store.writeTextArtifact("stderr", `${message}\n`);
-    const failed = await store.writeResult({
-      backend: options.backend,
-      status: "failed",
-      failureKind: "internal",
+  const workerLogFd = openSync(join(store.attemptDir, "worker.log"), "a");
+  let child;
+  try {
+    child = spawn(process.execPath, [workerPath(), payloadPath], {
       cwd: options.cwd,
-      startedAt,
-      completedAt: new Date(),
-      workspace: { mode: "shared", cwd: options.cwd },
-      sandbox: { enabled: sandboxEnabled(input) },
-      exitCode: null,
-      signal: null,
-      artifacts: [stderr],
+      detached: process.platform !== "win32",
+      stdio: ["ignore", workerLogFd, workerLogFd],
     });
-    const updatesSent = await notifyCompletion(options, failed, mode);
-    const annotated = await annotateCompletion(store, input, failed, updatesSent);
-    await finishTaskFromResult({ cwd: options.cwd, runId }, annotated).catch(() => undefined);
-    await appendRunEvent({ cwd: options.cwd, runId }, { type: "task.failed", taskId, status: "failed", message }).catch(() => undefined);
-    await appendRunEvent({ cwd: options.cwd, runId }, { type: "run.failed", status: "failed", message }).catch(() => undefined);
-  });
+  } finally {
+    closeSync(workerLogFd);
+  }
+  child.unref();
 
+  if (child.pid !== undefined) {
+    await updateAttemptProcess({
+      cwd: options.cwd,
+      runsDir: input.runsDir,
+      runId,
+      attemptId,
+      process: {
+        pid: child.pid,
+        processGroupId: process.platform === "win32" ? undefined : child.pid,
+        command: process.execPath,
+        workerPid: child.pid,
+        workerProcessGroupId: process.platform === "win32" ? undefined : child.pid,
+      },
+    }).catch(() => undefined);
+  }
+
+  armCompletionMonitor({ ...options, runId, attemptId, mode, store });
   return running;
 }

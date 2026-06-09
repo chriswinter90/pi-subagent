@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildAgentSystemPrompt, loadAgentByName } from "../../src/agents.ts";
 import { buildPiArgv } from "../../src/runners/headless-model.ts";
+import { runSubagent, SubagentValidationError } from "../../api.mjs";
 
 const tempRoot = await mkdtemp(join(tmpdir(), "pi-subagent-agents-"));
 try {
@@ -43,12 +44,12 @@ Always mention injected-agent-ok.
   assert.deepEqual(argv.slice(argv.indexOf("--tools"), argv.indexOf("--tools") + 2), ["--tools", "read,grep"]);
   assert.equal(argv.includes("--no-tools"), false);
 
-  const ignoredOverrideArgv = buildPiArgv({ agent: "review.security", task: "check ignored override", cwd, agentDefinition: agent, tools: ["read"] });
-  assert.deepEqual(ignoredOverrideArgv.slice(ignoredOverrideArgv.indexOf("--tools"), ignoredOverrideArgv.indexOf("--tools") + 2), ["--tools", "read,grep"]);
+  const narrowedOverrideArgv = buildPiArgv({ agent: "review.security", task: "check narrowed override", cwd, agentDefinition: agent, tools: ["read"] });
+  assert.deepEqual(narrowedOverrideArgv.slice(narrowedOverrideArgv.indexOf("--tools"), narrowedOverrideArgv.indexOf("--tools") + 2), ["--tools", "read"]);
 
-  const ignoredNoToolsArgv = buildPiArgv({ agent: "review.security", task: "check ignored no tools", cwd, agentDefinition: agent, tools: [] });
-  assert.deepEqual(ignoredNoToolsArgv.slice(ignoredNoToolsArgv.indexOf("--tools"), ignoredNoToolsArgv.indexOf("--tools") + 2), ["--tools", "read,grep"]);
-  assert.equal(ignoredNoToolsArgv.includes("--no-tools"), false);
+  const noToolsArgv = buildPiArgv({ agent: "review.security", task: "check no tools", cwd, agentDefinition: agent, tools: [] });
+  assert.equal(noToolsArgv.includes("--tools"), false);
+  assert.equal(noToolsArgv.includes("--no-tools"), true);
 
   const agentsOpenDir = join(cwd, ".pi", "agents");
   await writeFile(join(agentsOpenDir, "open.md"), `---
@@ -61,8 +62,7 @@ OPEN_AGENT_PROMPT_MARKER
   assert.ok(openAgent, "agent without tools should load");
   assert.equal(openAgent.tools, undefined);
   const openArgv = buildPiArgv({ agent: "open", task: "check default tools", cwd, agentDefinition: openAgent, tools: ["read"] });
-  assert.equal(openArgv.includes("--tools"), false, "agent without declared tools should ignore call tools and use default tool surface");
-  assert.equal(openArgv.includes("--no-tools"), false, "agent without declared tools should not disable tools");
+  assert.deepEqual(openArgv.slice(openArgv.indexOf("--tools"), openArgv.indexOf("--tools") + 2), ["--tools", "read"]);
 
   const agentlessArgv = buildPiArgv({ agent: "headless-worker", task: "check agentless tools", cwd, tools: ["read"] });
   assert.deepEqual(agentlessArgv.slice(agentlessArgv.indexOf("--tools"), agentlessArgv.indexOf("--tools") + 2), ["--tools", "read"]);
@@ -74,6 +74,28 @@ OPEN_AGENT_PROMPT_MARKER
   const noAgentArgv = buildPiArgv({ agent: "missing-compatible", task: "check default tools", cwd });
   assert.equal(noAgentArgv.includes("--tools"), false, "missing agent definition without call tools should not constrain tools");
   assert.equal(noAgentArgv.includes("--no-tools"), false, "missing agent definition without call tools should not disable tools");
+
+  const explicitPromptArgv = buildPiArgv({ agent: "review.security", task: "raw task prompt", cwd, agentDefinition: agent, systemPrompt: "COMPILED_SYSTEM_PROMPT", skills: ["/tmp/skill"], extensions: ["/tmp/ext.ts"] });
+  assert.equal(explicitPromptArgv.includes("--append-system-prompt"), false, "systemPrompt should suppress agent prompt append");
+  assert.deepEqual(explicitPromptArgv.slice(explicitPromptArgv.indexOf("--system-prompt"), explicitPromptArgv.indexOf("--system-prompt") + 2), ["--system-prompt", "COMPILED_SYSTEM_PROMPT"]);
+  assert.deepEqual(explicitPromptArgv.slice(explicitPromptArgv.indexOf("--skill"), explicitPromptArgv.indexOf("--skill") + 2), ["--skill", "/tmp/skill"]);
+  assert.deepEqual(explicitPromptArgv.slice(explicitPromptArgv.indexOf("--extension"), explicitPromptArgv.indexOf("--extension") + 2), ["--extension", "/tmp/ext.ts"]);
+  assert.match(explicitPromptArgv.at(-1), /^raw task prompt$/);
+
+  await assert.rejects(
+    () => runSubagent({ cwd, backend: "inline", agent: "review.security", agentScope: "project", confirmProjectAgents: false, task: "check expansion", tools: ["read", "write"] }),
+    (error) => error instanceof SubagentValidationError && /caller tools expand/.test(error.message),
+  );
+
+  await assert.rejects(
+    () => runSubagent({ cwd, backend: "inline", agent: "review.security", agentScope: "project", confirmProjectAgents: false, systemPrompt: "COMPILED", task: "check compiled prompt expansion", tools: ["write"] }),
+    (error) => error instanceof SubagentValidationError && /caller tools expand/.test(error.message),
+  );
+
+  await assert.rejects(
+    () => runSubagent({ cwd, backend: "inline", agent: "open", agentScope: "project", confirmProjectAgents: false, task: "check undefined tools", tools: ["read"] }),
+    (error) => error instanceof SubagentValidationError && /does not declare a tools authority ceiling/.test(error.message),
+  );
 
   const globalOnly = await loadAgentByName("review.security", cwd, "global");
   assert.equal(globalOnly, undefined, "global scope should not load project agent");

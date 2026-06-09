@@ -32,14 +32,25 @@ Every call has an `action`. The default is `run`, so omitting `action` starts a 
 
 | `action` | Purpose | Key parameters |
 |---|---|---|
-| `run` (default) | Start a new subagent (single or parallel). | `agent`/`task` or `tasks`; plus `sandbox`, `worktree`, `model`, `async`, etc. |
-| `status` | Read a run's current state. | `runId`, optional `taskId` |
-| `logs` | Read a run's captured logs. | `runId`, optional `taskId` |
+| `run` (default) | Start a new subagent run, or launch independent runs in parallel. | `agent`/`task` or `tasks`; plus `sandbox`, `worktree`, `model`, `async`, etc. |
+| `status` | Read a run's current state. | `runId`, optional `attemptId` |
+| `logs` | Read a run's captured logs. | `runId`, optional `attemptId` |
 | `wait` | Block until a run finishes. | `runId`, optional `timeoutMs`, `pollIntervalMs` |
-| `interrupt` | Signal a process-backed run. | `runId`, optional `signal`, `escalateAfterMs`, `killAfterMs`, `reason` |
+| `interrupt` | Signal a process-backed run. | `runId`, optional `attemptId`, `signal`, `escalateAfterMs`, `killAfterMs`, `reason` |
 | `mark-background` | Mark a run as not needed before the final answer. | `runId` |
+| `reconcile` | Re-read durable artifacts and repair stale/orphaned state when possible. | `runId` |
 
-State is file-based under `.pi/agent/runs/<run-id>/`. `status`/`logs`/`wait` read those files; `interrupt` sends a real OS signal; `mark-background` updates run metadata.
+State is file-based under `.pi/agent/runs/<run-id>/`. `status`/`logs`/`wait` read those files; `interrupt` sends a real OS signal; `mark-background` updates run metadata; `reconcile` repairs local metadata from durable attempt artifacts without relaunching work.
+
+Model:
+
+```text
+run = one subagent execution
+attempt = one launch attempt
+correlationId = optional external trace label
+```
+
+`taskId` remains accepted as a deprecated read alias for older artifacts.
 
 ## Calling the tool
 
@@ -56,6 +67,7 @@ import {
   getSubagentLogs,
   waitForSubagent,
   interruptSubagent,
+  reconcileSubagentRun,
 } from "@agwab/pi-subagent/api";
 
 const run = await runSubagent({
@@ -70,15 +82,16 @@ const status = await getSubagentStatus({ cwd: process.cwd(), runId: run.runId })
 const logs = await getSubagentLogs({ cwd: process.cwd(), runId: run.runId });
 await waitForSubagent({ cwd: process.cwd(), runId: run.runId, timeoutMs: 300000 });
 await interruptSubagent({ cwd: process.cwd(), runId: run.runId, reason: "caller cancelled" });
+await reconcileSubagentRun({ cwd: process.cwd(), runId: run.runId });
 ```
 
-`runSubagent` accepts the same run options as the tool, plus an optional `signal`. Existing-run helpers accept `cwd`, `runId`, and optional `taskId`. The API is intentionally object-only and does not expose the lower-level runner internals.
+`runSubagent` accepts the same run options as the tool, plus an optional `signal`. Existing-run helpers accept `cwd`, `runId`, optional `attemptId`, and optional `runsDir`. The API is intentionally object-only and does not expose the lower-level runner internals.
 
 The code API is ESM-only. Import `@agwab/pi-subagent/api`; do not deep-import internal files such as `src/orchestrate/*` because only documented package subpaths are public.
 
 Project-local agents are repository-controlled. The code API has no interactive prompt, so project-local agents require explicit opt-in with `confirmProjectAgents:false` for trusted repositories.
 
-## Single task
+## Single run
 
 ```json
 {
@@ -99,7 +112,9 @@ Project-local agents are repository-controlled. The code API has no interactive 
 }
 ```
 
-Parallel tasks use isolated git worktrees by default so worker mutations do not collide in the base checkout. Explicit shared-checkout parallel mutation is rejected.
+Parallel launches are independent runs started concurrently. The response contains `runIds` and per-run results; there is no aggregate run, aggregate task, dependency scheduling, or fan-in status.
+
+Parallel runs use isolated git worktrees by default so worker mutations do not collide in the base checkout. Explicit shared-checkout parallel mutation is rejected.
 
 Use `concurrency` to cap parallel fan-out:
 
@@ -167,15 +182,20 @@ Interrupt a process-backed run:
 | Option | Use |
 |---|---|
 | `cwd` | Run from a specific project directory. Existing-run actions also accept `cwd` to find that run registry. |
-| `timeoutMs` | Limit worker execution time for `run`; limit polling duration for `action: "wait"`. |
+| `timeoutMs` | Limit worker execution time for `run`; limit polling duration for `action: "wait"`. Omit it for no runtime kill deadline; `wait` alone defaults to 60s polling. |
 | `visible` | Use a visible tmux-backed worker (`visible: true`). |
-| `concurrency` | Cap parallel task fan-out. |
+| `concurrency` | Cap parallel run fan-out. |
 | `model` | Select a Pi model/provider for model-backed workers. |
 | `thinking` / `thinkingLevel` / `reasoningLevel` | Set the reasoning level. |
-| `tools` | Agentless tool allowlist. Ignored when `agent` is set; use agent frontmatter instead. |
+| `tools` | Tool allowlist. With a named agent this may only narrow agent-declared tools; it cannot expand authority. For agentless runs it sets the full tool allowlist. |
 | `roleContext` | Add one-off role instructions without creating an agent file. |
 | `agentScope` | Restrict agent lookup to `auto`, `global`, or `project`. |
 | `confirmProjectAgents` | Set `false` to skip the project-agent confirmation prompt for trusted repositories. |
+| `systemPrompt` | Full system prompt override. When provided, it wins over any agent file prompt; named-agent frontmatter such as `tools`, `model`, and `thinking` may still apply. |
+| `skills` | Explicit Pi skills to load for headless/tmux child Pi. Ambient skills remain disabled. Inline backend rejects this option. |
+| `extensions` | Explicit Pi extensions to load for headless/tmux child Pi. Ambient extensions remain disabled. Inline backend rejects this option. |
+| `runsDir` | Safe relative artifact root under `cwd`; default `.pi/agent/runs`. |
+| `correlationId` | Optional external trace label, e.g. a workflow run id. It has no scheduling or aggregation semantics. |
 
 ## Sandbox
 
@@ -249,9 +269,11 @@ Supported explicit backend values are `auto`, `inline`, `headless`, and `tmux`. 
 
 When `agent` names a Pi agent markdown file, the engine injects that agent's body as system prompt context and inherits supported frontmatter such as `model`, `thinking`, and `tools`.
 
-`tools` can be declared in the agent file as that agent's tool allowlist. When `agent` is set, call-level `tools` is ignored; define tools in the agent file instead. If the agent file omits `tools`, the worker uses Pi's default tool surface.
+`tools` declared in the agent file are that agent's authority ceiling. Call-level `tools` may narrow the set, including `tools: []`, but cannot add tools the agent did not declare. If an agent file omits `tools`, call-level `tools` is rejected for that named agent; omit `tools` to use Pi's default surface.
 
-For agentless model-backed runs, call-level `tools` can set the tool allowlist. Use `tools: []` to run an agentless task with no tools.
+For agentless model-backed runs, call-level `tools` can set the full tool allowlist. Use `tools: []` to run an agentless task with no tools.
+
+`systemPrompt` is a full override for orchestrators that compile prompts themselves. When provided, it is passed as the final system prompt and no agent prompt is appended. If `agent` is also provided, the agent file is still loaded for approval and frontmatter policy (`tools`, `model`, `thinking`), but its body is not appended to the prompt.
 
 Use `roleContext` for extra worker role instructions without creating a reusable agent file:
 
@@ -304,6 +326,12 @@ off | minimal | low | medium | high | xhigh
 
 These options may also be set per task in `tasks[]`.
 
+Timeout notes:
+
+- `timeoutMs` on a run is the worker execution deadline. If omitted, pi-subagent does not impose a run timeout.
+- `action:"wait"` uses `timeoutMs` as a polling deadline and defaults to 60 seconds.
+- `onComplete:"notify"` uses an internal completion monitor with a long safety window; it does not kill the worker. Orchestrators that need a 4h or other SLA should pass `timeoutMs` explicitly on the run.
+
 ## Artifacts
 
 Runs write durable evidence under:
@@ -312,12 +340,16 @@ Runs write durable evidence under:
 .pi/agent/runs/<run-id>/
 ├── run.json
 ├── events.jsonl
-└── <task-id>/
-    ├── result.json
-    ├── stdout.log
-    ├── stderr.log
-    └── output.log
+└── attempts/
+    └── <attempt-id>/
+        ├── result.json
+        ├── worker.json
+        ├── stdout.log
+        ├── stderr.log
+        └── output.log
 ```
+
+Older `schemaVersion: 1` artifacts under `<run-id>/<task-id>/` are still readable for compatibility.
 
 Tool responses return compact status and artifact references rather than raw logs.
 
@@ -327,7 +359,7 @@ Tool responses return compact status and artifact references rather than raw log
 /subagent panel
 ```
 
-The panel is read-only. It shows all/completed/failed filters, run/task details, workspace/artifact paths, dependency metadata, event tail, and log tail. The panel is for human inspection; existing-run tool actions remain the programmatic interface.
+The panel shows all/completed/failed filters, run/attempt details, workspace/artifact paths, dependency metadata, event tail, and log tail. The panel is for human inspection; existing-run tool actions remain the programmatic interface.
 
 ## Development validation
 
@@ -335,6 +367,5 @@ In this source checkout:
 
 ```bash
 npm run validate
-npm run validate:stress
 npm pack --dry-run --json
 ```
