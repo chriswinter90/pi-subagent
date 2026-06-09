@@ -7,6 +7,7 @@ import { buildAgentSystemPrompt, type AgentDefinition } from "../agents.ts";
 import { createAttemptArtifactStore, type ArtifactRef, type ResultEnvelope } from "../artifacts/index.ts";
 import type { ResultWorkspace } from "../artifacts/result.ts";
 import { THINKING_LEVELS, type AgentScope, type FailureKind, type ThinkingLevel } from "../core/constants.ts";
+import { detectContextLengthExceeded } from "./headless-model.ts";
 
 export interface RunInlineModelOptions {
   agent: string;
@@ -353,6 +354,6 @@ export async function runInlineModel(options: RunInlineModelOptions): Promise<Re
     signal: failureKind === "abort" ? "ABORT" : null,
     artifacts,
     correlationId: options.correlationId,
-    metadata: { contextLengthExceeded: /context[_ -]?length[_ -]?exceeded|context window|too large/i.test(`${stdoutText}\n${stderrText}`) },
+    metadata: { contextLengthExceeded: detectContextLengthExceeded({ stderrText }) },
   });
 }

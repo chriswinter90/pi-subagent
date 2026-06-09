@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { createResultEnvelope } from "../../src/artifacts/index.ts";
 import { validateResolveInput } from "../../src/core/validation.ts";
 import { createRunStatusSnapshot, isTerminalStatus, statusFailedClosed, statusSucceeded } from "../../src/orchestrate/index.ts";
+import { detectContextLengthExceeded, parsePiJsonLines } from "../../src/runners/headless-model.ts";
 
 const plannedInput = {
   backend: "auto",
@@ -61,6 +62,16 @@ assert.equal(taskModelValidation.ok, true);
 assert.equal(taskModelValidation.input.tasks[0].model, "kimi-coding/kimi-for-coding");
 assert.equal(taskModelValidation.input.tasks[0].thinking, "high");
 assert.deepEqual(taskModelValidation.input.tasks[0].tools, []);
+
+const benignContextWindowOutput = parsePiJsonLines([
+  JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Subagents are isolated context windows." }] } }),
+  "",
+].join("\n"));
+assert.equal(benignContextWindowOutput.finalAssistantText, "Subagents are isolated context windows.");
+assert.equal(detectContextLengthExceeded({ stderrText: "", errors: benignContextWindowOutput.errors }), false);
+assert.equal(detectContextLengthExceeded({ stderrText: "Error: context length exceeded" }), true);
+assert.equal(detectContextLengthExceeded({ stderrText: "Error: request payload is too large for the context limit" }), true);
+assert.equal(detectContextLengthExceeded({ stderrText: "The context window is documented here, not exceeded." }), false);
 
 const invalid = validateResolveInput({ mode: "fanout" });
 assert.equal(invalid.ok, false);

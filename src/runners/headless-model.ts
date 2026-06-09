@@ -53,6 +53,14 @@ export interface PiJsonParseResult {
   metadata: Partial<ResultMetadata>;
 }
 
+const CONTEXT_LENGTH_ERROR_PATTERN =
+  /\bcontext[_ -]?length[_ -]?exceeded\b|\bcontext[_ -]?window[_ -]?(?:exceeded|overflow|exhausted)\b|\b(?:maximum|max)[_ -]?context[_ -]?length\b|\btoo many tokens\b|\b(?:prompt|input|request)[^\n]{0,80}\btoo large\b|\bcontext_length_exceeded\b/i;
+
+export function detectContextLengthExceeded(signals: { stderrText?: string; errors?: readonly string[] }): boolean {
+  const text = [signals.stderrText, ...(signals.errors ?? [])].filter((entry): entry is string => typeof entry === "string" && entry.length > 0).join("\n");
+  return CONTEXT_LENGTH_ERROR_PATTERN.test(text);
+}
+
 function normalizeTimeoutMs(timeoutMs: number | undefined): number | undefined {
   if (timeoutMs === undefined) return undefined;
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
@@ -332,7 +340,7 @@ export async function runHeadlessModel(options: RunHeadlessModelOptions): Promis
   const stdoutText = stdout.toString("utf8");
   const stderrText = stderr.toString("utf8");
   const parsed = parsePiJsonLines(stdoutText);
-  const contextLengthExceeded = /context[_ -]?length[_ -]?exceeded|context window|too large/i.test(`${stdoutText}\n${stderrText}`);
+  const contextLengthExceeded = detectContextLengthExceeded({ stderrText, errors: parsed.errors });
 
   let outcome = processOutcome;
   if (processOutcome.status === "completed" && parsed.parseErrors.length > 0 && parsed.finalAssistantText.length === 0) {

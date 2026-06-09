@@ -6,7 +6,7 @@ import { createAttemptArtifactStore, type ArtifactRef, type ResultEnvelope } fro
 import type { ResultWorkspace } from "../artifacts/result.ts";
 import type { FailureKind, SandboxInput, Status } from "../core/constants.ts";
 import { SandboxUnavailableError, withSandboxedArgv } from "../sandbox/srt.ts";
-import { buildPiArgv, parsePiJsonLines, type RunHeadlessModelOptions } from "./headless-model.ts";
+import { buildPiArgv, detectContextLengthExceeded, parsePiJsonLines, type RunHeadlessModelOptions } from "./headless-model.ts";
 
 const execFileAsync = promisify(execFile);
 const POLL_INTERVAL_MS = 100;
@@ -285,14 +285,14 @@ export async function runTmuxModel(options: RunTmuxModelOptions): Promise<Result
       signal: failure?.signal ?? null,
       artifacts,
       correlationId: options.correlationId,
-      metadata: { contextLengthExceeded: /context[_ -]?length[_ -]?exceeded|context window|too large/i.test(stderr ?? "") },
+      metadata: { contextLengthExceeded: detectContextLengthExceeded({ stderrText: stderr ?? "" }) },
     });
   }
 
   const stdoutText = await import("node:fs/promises").then(({ readFile }) => readFile(store.pathFor("stdout"), "utf8").catch(() => ""));
   const stderrText = await import("node:fs/promises").then(({ readFile }) => readFile(store.pathFor("stderr"), "utf8").catch(() => ""));
   const parsed = parsePiJsonLines(stdoutText);
-  const contextLengthExceeded = /context[_ -]?length[_ -]?exceeded|context window|too large/i.test(`${stdoutText}\n${stderrText}`);
+  const contextLengthExceeded = detectContextLengthExceeded({ stderrText, errors: parsed.errors });
   let meta = result.meta;
   if (meta.status === "completed" && parsed.parseErrors.length > 0 && parsed.finalAssistantText.length === 0) {
     meta = { ...meta, status: "failed", failureKind: "parse" };
