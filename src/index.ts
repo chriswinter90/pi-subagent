@@ -104,6 +104,36 @@ interface ToolResult {
   isError: boolean;
 }
 
+const ANSI_PATTERN = /\u001b\[[0-?]*[ -/]*[@-~]/g;
+
+function visibleLength(text: string): number {
+  return text.replace(ANSI_PATTERN, "").length;
+}
+
+function clip(text: string, width: number): string {
+  if (width <= 0) return "";
+  if (visibleLength(text) <= width) return text;
+  if (width <= 1) return "…";
+
+  let output = "";
+  let visible = 0;
+  for (let index = 0; index < text.length && visible < width - 1; ) {
+    if (text.charCodeAt(index) === 0x1b) {
+      ANSI_PATTERN.lastIndex = index;
+      const match = ANSI_PATTERN.exec(text);
+      if (match && match.index === index) {
+        output += match[0];
+        index = ANSI_PATTERN.lastIndex;
+        continue;
+      }
+    }
+    output += text[index];
+    visible += 1;
+    index += 1;
+  }
+  return `${output}…`;
+}
+
 class SingleLineComponent {
   constructor(private readonly text: string) {}
 
@@ -111,8 +141,8 @@ class SingleLineComponent {
     // Static one-line component.
   }
 
-  render(_width: number): string[] {
-    return [this.text];
+  render(width: number): string[] {
+    return [clip(this.text, width)];
   }
 }
 

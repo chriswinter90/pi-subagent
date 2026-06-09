@@ -93,6 +93,8 @@ async function main() {
   assert.match(parallelCallText, /subagent run · parallel · 2 runs · notify/);
   const statusCallText = renderText(registeredTool.renderCall({ action: "status", runId: "run_example", attemptId: "attempt-1" }, callTheme), 120);
   assert.match(statusCallText, /subagent status · run_example · attempt-1/);
+  const narrowCallText = renderText(registeredTool.renderCall({ task: "Review-only task. Do not edit files. Do not exceed the available TUI width.", async: true }, callTheme), 30);
+  assert.ok(narrowCallText.length <= 30, "renderCall should truncate to the available render width");
   assert.ok(registeredCommand, "subagent command should register");
   assert.equal(registeredCommand.name, "subagent");
   assert.equal(typeof registeredCommand.handler, "function");
