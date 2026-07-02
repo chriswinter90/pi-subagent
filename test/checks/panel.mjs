@@ -396,6 +396,7 @@ async function main() {
 			failureKind: "timeout",
 			log: "failed timeout tail",
 		});
+		const scrollBase = Date.now();
 		for (let index = 0; index < 24; index += 1) {
 			await writeRun(
 				cwd,
@@ -405,6 +406,8 @@ async function main() {
 					status: "completed",
 					backend: "headless",
 					log: `scroll run ${index}`,
+					startedAt: new Date(scrollBase - 90_000 + index).toISOString(),
+					completedAt: new Date(scrollBase + index).toISOString(),
 				},
 			);
 		}
