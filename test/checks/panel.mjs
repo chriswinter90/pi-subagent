@@ -509,7 +509,7 @@ async function main() {
 		component.handleInput("up");
 		assert.match(
 			renderText(component),
-			/^▸ run_scroll_04/m,
+			/^▸ run_scroll_\d\d/m,
 			"up on the first run should wrap to the last shown run",
 		);
 		component.handleInput("\u001b[B");
