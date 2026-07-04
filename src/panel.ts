@@ -512,12 +512,14 @@ async function readTask(
 	mtimeMs: number,
 	loadTails: boolean,
 	currentSessionId?: string,
+	options: { staleOverride?: boolean } = {},
 ): Promise<TaskRow | null> {
 	const parsed = await readJson(resultPath);
 	if (!isResultEnvelope(parsed)) return null;
 	const log = await readLogTail(cwd, parsed, loadTails, currentSessionId);
 	const stale =
-		isActive(parsed.status) && Date.now() - mtimeMs > STALE_RUN_AFTER_MS;
+		isActive(parsed.status) &&
+		(options.staleOverride ?? Date.now() - mtimeMs > STALE_RUN_AFTER_MS);
 	return {
 		attemptId: parsed.attemptId ?? parsed.taskId ?? "unknown",
 		status: stale ? "failed" : parsed.status,
@@ -571,6 +573,7 @@ async function readTaskFromRegistry(
 	loadTails: boolean,
 	currentSessionId?: string,
 ): Promise<TaskRow> {
+	const registryStale = registryTaskStale(task);
 	if (
 		task.artifactCwd !== undefined &&
 		task.resultPath !== undefined &&
@@ -590,13 +593,14 @@ async function readTaskFromRegistry(
 					statInfo.mtimeMs,
 					loadTails,
 					currentSessionId,
+					isActive(task.status) ? { staleOverride: registryStale } : undefined,
 				);
 				if (parsed !== null) return parsed;
 			}
 		}
 	}
 	const log = await readTailFromRegistryPath(task, loadTails, currentSessionId);
-	const stale = registryTaskStale(task);
+	const stale = registryStale;
 	return {
 		attemptId: task.attemptId ?? task.taskId ?? "unknown",
 		status: stale ? "failed" : task.status,

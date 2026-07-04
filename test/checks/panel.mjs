@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createJiti } from "jiti";
@@ -142,6 +142,9 @@ async function writeIndexedRun(indexDir, cwd, runId, attemptId, options) {
 						failureKind: options.failureKind ?? null,
 						startedAt: result.startedAt,
 						updatedAt: options.updatedAt ?? now,
+						...(options.heartbeatAt
+							? { heartbeatAt: options.heartbeatAt }
+							: {}),
 						completedAt: result.completedAt,
 						artifactCwd: cwd,
 						resultPath: resultRel,
@@ -154,6 +157,13 @@ async function writeIndexedRun(indexDir, cwd, runId, attemptId, options) {
 			2,
 		)}\n`,
 	);
+	if (options.resultMtime !== undefined) {
+		await utimes(
+			join(cwd, resultRel),
+			options.resultMtime,
+			options.resultMtime,
+		);
+	}
 	await mkdir(indexDir, { recursive: true });
 	await writeFile(
 		join(indexDir, `${runId}.json`),
@@ -698,6 +708,22 @@ async function main() {
 			backend: "headless",
 			log: "legacy indexed run without session metadata",
 		});
+		const freshHeartbeat = new Date(Date.now() - 10_000).toISOString();
+		await writeIndexedRun(
+			indexDir,
+			cwd,
+			"run_registry_fresh_active",
+			"attempt-1",
+			{
+				status: "running",
+				backend: "headless",
+				parentSessionId: sessionId,
+				updatedAt: freshHeartbeat,
+				heartbeatAt: freshHeartbeat,
+				resultMtime: new Date(Date.now() - 120_000),
+				log: "registry heartbeat still fresh",
+			},
+		);
 		await writeFile(
 			join(indexDir, "run_stale.json"),
 			`${JSON.stringify({ schemaVersion: 1, runId: "run_stale", cwd: join(tempRoot, "missing-workspace"), updatedAt: new Date().toISOString() }, null, 2)}\n`,
@@ -725,6 +751,16 @@ async function main() {
 			text,
 			/run_session_other_cwd/,
 			"session scope should include same-session other cwd run",
+		);
+		assert.match(
+			text,
+			/run_registry_fresh_active[^\n]*running/,
+			"fresh registry heartbeat should keep old active result files running",
+		);
+		assert.doesNotMatch(
+			text,
+			/run_registry_fresh_active[^\n]*failed/,
+			"fresh registry heartbeat should not render as stale failed",
 		);
 		assert.match(
 			text,
@@ -817,7 +853,7 @@ async function main() {
 		}
 		scoped.component.handleInput("r");
 		await waitFor(
-			() => /53\/63 shown/.test(renderText(scoped.component)),
+			() => /54\/64 shown/.test(renderText(scoped.component)),
 			"all scope should cap default terminal rows at 50",
 		);
 		text = renderText(scoped.component);
@@ -828,7 +864,7 @@ async function main() {
 		);
 		scoped.component.handleInput("m");
 		await waitFor(
-			() => /63\/63 shown/.test(renderText(scoped.component)),
+			() => /64\/64 shown/.test(renderText(scoped.component)),
 			"all scope show more should reveal all hidden terminal rows",
 		);
 		scoped.component.handleInput("q");
@@ -894,6 +930,7 @@ async function main() {
 						"enter no-op",
 						"q/escape close",
 						"session/cwd/all scope switching",
+						"registry-backed active result freshness",
 						"stale/malformed global locator accounting",
 						"raw session id redaction",
 						"tool execute argument order compatibility",
